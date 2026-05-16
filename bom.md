@@ -152,34 +152,4 @@ If compiling the C version on Volumio, expected packages include:
 | As needed | M2.5 standoffs | Keep spare 5 mm, 8 mm, 10 mm, 15 mm, and 16 mm sizes |
 | As needed | Small zip ties or cable clips | Only if internal wiring is added |
 
-## 9. Fit-critical notes
-
-Do not replace the current lid/LCD geometry with v4.9 geometry. The current base is the version that fits properly.
-
-Critical SCAD values:
-
-```scad
-lcd_w = 85.42;
-lcd_d = 55.60;
-lcd_screw_keepout = 14.0;
-audio_slot_h = 17.0;
-side_foot_w = 14.0;
-side_foot_h = 14.0;
-side_foot_raise = 1.0;
-```
-
 The case is intended to sit on its rear side with the DAC/audio ports facing up. The four square solid pads are for adhesive feet so the case does not slide on a desk.
-
-## 10. Suggested spare parts
-
-Keep these on hand:
-
-- Extra M2.5 x 4 mm screws
-- Extra M2.5 x 6 mm screws
-- Extra M2.5 8 mm, 15 mm, and 16 mm standoffs
-- Extra sticky feet
-- Spare microSD card
-- Spare short Ethernet cable
-- Spare LCD ribbon/header parts, if your display uses them
-- Small washers for minor stack-height correction
-
