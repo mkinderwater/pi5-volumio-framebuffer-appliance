@@ -377,6 +377,12 @@ static void close_framebuffer(void) {
     g_prev_frame_valid = false;
 }
 
+static uint16_t color_to_rgb565(Color c) {
+    return (uint16_t)(((c.r & 0xF8) << 8) |
+                      ((c.g & 0xFC) << 3) |
+                      (c.b >> 3));
+}
+
 static void write_framebuffer(void) {
     if (!g_fb && !open_framebuffer()) return;
 
@@ -461,6 +467,28 @@ static void clear_image(Color c) {
             g_img[y][x][2] = c.b;
         }
     }
+}
+
+static void blank_physical_framebuffer(Color c) {
+    if (!g_fb && !open_framebuffer()) return;
+
+    uint16_t px = color_to_rgb565(c);
+
+    for (int i = 0; i < WIDTH * HEIGHT; i++) {
+        g_fb[i] = px;
+    }
+
+    clear_image(c);
+
+    /*
+      Dirty-rectangle mode keeps a previous-frame cache.
+      After a hard physical blank, force the next normal render to be full-frame.
+    */
+    g_prev_frame_valid = false;
+
+#ifdef MS_SYNC
+    msync(g_fb, FB_BYTES, MS_SYNC);
+#endif
 }
 
 static void fill_rect(int x0, int y0, int x1, int y1, Color c) {
@@ -1967,6 +1995,7 @@ int main(void) {
     }
 
     hide_console_cursor(true);
+    blank_physical_framebuffer(BG_COLOR);
 
     while (g_running) {
         double start = monotonic_seconds();
