@@ -18,7 +18,7 @@
   },
 
   "debug": {
-    "enabled": true,
+    "enabled": false,
     "log_path": "/var/log/volumio-clock-fb.log",
     "max_bytes": 262144
   }
