@@ -2,9 +2,7 @@ This is a small, purpose-built Raspberry Pi 5 Volumio appliance with M.2 storage
 
 The hardware is only half the project. The other half is the display program, written in C.
 
-Instead of running a desktop, browser, kiosk mode, or heavy plugin just to show basic music info, this build writes directly to the Linux framebuffer.
-
-- No X11, Wayland, Chromium, or bloated UI stack sitting in the background.
+Instead of running a desktop, browser, kiosk mode, or heavy plugin just to show basic music info, this build writes directly to the Linux framebuffer. No X11, Wayland, Chromium, or heavy UI stack running in the background. On my Raspberry Pi 5, it usually sits under 1% CPU.
 
 The goal is simple: show useful Volumio information without wasting the Pi.
 
