@@ -1,0 +1,25 @@
+{
+  // Save this file as:
+  // /etc/volumio_display.json
+  //
+  // Edit with:
+  // sudo nano /etc/volumio_display.json
+  // remove all comments from json before you save
+
+  "display": {
+    "fb_path": "/dev/fb0",
+    "width": 480,
+    "height": 320,
+    "default_24h_format": false
+  },
+
+  "volumio": {
+    "wait_timeout_seconds": 8
+  },
+
+  "debug": {
+    "enabled": true,
+    "log_path": "/var/log/volumio-clock-fb.log",
+    "max_bytes": 262144
+  }
+}
