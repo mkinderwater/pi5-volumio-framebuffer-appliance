@@ -16,6 +16,8 @@ The screen displays:
 - Playback state
 - Network status
 - Offline status
+- Album artwork
+- Media type and sample rate
 - Simple visual feedback
 - Large clock mode when nothing is playing
 - Smaller clock with track info when music is active
