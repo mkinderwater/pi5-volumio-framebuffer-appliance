@@ -2725,9 +2725,10 @@ static bool draw_volume_overlay_if_needed(double now) {
     return true;
 }
 
-static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating) {
+static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool *out_force_full_redraw) {
     *out_needs_scroll = false;
     *out_layout_animating = false;
+    *out_force_full_redraw = false;
 
     update_volumio_state();
     apply_wait_timeout(monotonic_seconds());
@@ -2753,6 +2754,22 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating) {
             if (s_anim_progress < 0.0f) s_anim_progress = 0.0f;
             *out_layout_animating = true;
         }
+    }
+
+    // Idle safety redraw: once per displayed minute, force the next framebuffer
+    // flush to rewrite the whole screen. This keeps the idle clock simple and
+    // clears any stray console/framebuffer noise without touching active playback.
+    static int s_last_idle_minute_key = -1;
+    bool fully_idle = (!show_metadata && s_anim_progress <= 0.01f);
+    int idle_minute_key = (now_tm.tm_yday * 24 * 60) + (now_tm.tm_hour * 60) + now_tm.tm_min;
+
+    if (fully_idle) {
+        if (s_last_idle_minute_key != idle_minute_key) {
+            *out_force_full_redraw = true;
+            s_last_idle_minute_key = idle_minute_key;
+        }
+    } else {
+        s_last_idle_minute_key = -1;
     }
 
     draw_fill_rect(0, 0, g_width, g_height, BG_COLOR);
@@ -3189,8 +3206,9 @@ int main(void) {
     while (g_running) {
         bool needs_scroll = false;
         bool layout_animating = false;
+        bool force_full_redraw = false;
 
-        bool is_playing = draw_clock(&needs_scroll, &layout_animating);
+        bool is_playing = draw_clock(&needs_scroll, &layout_animating, &force_full_redraw);
 
         if (layout_animating || g_colon_fade_active || (needs_scroll && is_playing)) {
             // Full-rate only when something on screen actually benefits from it.
@@ -3205,6 +3223,10 @@ int main(void) {
 
         if (target_fps <= 0.0) target_fps = HARDWARE_FPS_STATIC;
         target_interval = 1.0 / target_fps;
+
+        if (force_full_redraw) {
+            g_prev_frame_valid = false;
+        }
 
         flush_native_to_fb();
 
