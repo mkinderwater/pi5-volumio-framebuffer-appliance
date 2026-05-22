@@ -1,4 +1,4 @@
-# Volumio Framebuffer Display
+# volumio_fbd
 
 This project is a lightweight display interface for a Raspberry Pi running Volumio.
 
@@ -44,7 +44,7 @@ Playback data comes from the local Volumio API:
 http://127.0.0.1:3000/api/v1/getState
 ```
 
-The program polls the API, parses the JSON response with `json-c`, and updates the screen based on whether Volumio is playing, paused, stopped, or unavailable.
+The program polls the API, parses the JSON response with json-c, and updates the screen based on whether Volumio is playing, paused, stopped, or unavailable.
 
 ## Graphics
 
@@ -147,26 +147,26 @@ You should see:
 Upload the compiled binary to:
 
 ```text
-/home/volumio/volumio_clock_fb
+/home/volumio/volumio_fbd
 ```
 
 Example using SCP from another machine:
 
 ```bash
-scp volumio_clock_fb volumio@volumio.local:/home/volumio/
+scp volumio_fbd volumio@volumio.local:/home/volumio/
 ```
 
 ## 7. Install the binary
 
 ```bash
-sudo cp /home/volumio/volumio_clock_fb /usr/local/bin/volumio_clock_fb
-sudo chmod +x /usr/local/bin/volumio_clock_fb
+sudo cp /home/volumio/volumio_fbd /usr/local/bin/volumio_fbd
+sudo chmod +x /usr/local/bin/volumio_fbd
 ```
 
 ## 8. Create the systemd service
 
 ```bash
-sudo nano /etc/systemd/system/volumio-clock.service
+sudo nano /etc/systemd/system/volumio_fbd.service
 ```
 
 Paste:
@@ -180,7 +180,7 @@ Wants=systemd-udev-settle.service network-online.target time-sync.target
 [Service]
 Type=simple
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/fb0 ] && exit 0; sleep 1; done; echo "/dev/fb0 missing"; exit 1'
-ExecStart=/usr/local/bin/volumio_clock_fb
+ExecStart=/usr/local/bin/volumio_fbd
 Restart=always
 RestartSec=2
 User=root
@@ -195,20 +195,20 @@ Save and exit.
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable volumio-clock.service
-sudo systemctl start volumio-clock.service
+sudo systemctl enable volumio_fbd.service
+sudo systemctl start volumio_fbd.service
 ```
 
 ## 10. Check service status
 
 ```bash
-systemctl status volumio-clock.service --no-pager
+systemctl status volumio_fbd.service --no-pager
 ```
 
 View logs:
 
 ```bash
-journalctl -u volumio-clock.service -n 80 --no-pager
+journalctl -u volumio_fbd.service -n 80 --no-pager
 ```
 
 ## 11. Reboot test
