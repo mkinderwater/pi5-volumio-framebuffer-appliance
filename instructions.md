@@ -64,6 +64,23 @@ The config file is located at:
 
 On startup, the program can create the config file automatically if it does not already exist.
 
+The config file lets the display be adjusted without rebuilding the C program. It is meant for basic hardware and display preferences, not for replacing the program logic.
+
+Depending on the build, the config can control items such as:
+
+- Framebuffer device path, usually `/dev/fb0`
+- Screen width and height
+- Clock format, such as 12-hour or 24-hour display
+- Temperature unit, such as C or F
+- Idle and playback screen behaviour
+- How long playback information remains visible before returning to the large clock
+- Optional debug logging
+- Log file path and size limits
+
+This makes it easier to move the same binary between similar Raspberry Pi or LCD setups. For example, a different framebuffer path, screen size, clock preference, or temperature unit can be changed in JSON instead of editing and recompiling the source code.
+
+If the config file is deleted, the program can recreate it with built-in defaults the next time it starts.
+
 The service runs as root so it can access `/dev/fb0` and create the config file under `/etc`.
 
 # Install instructions
