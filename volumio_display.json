@@ -6,19 +6,19 @@
   // remove all comments from json before you save
 
 {
-  "display": {
-    "fb_path": "/dev/fb0",
-    "width": 480,
-    "height": 320,
-    "clock_type": "12h",
-    "cpu_temp_unit": "C"
+  "display":{
+    "fb_path":"/dev/fb0",
+    "width":480,
+    "height":320,
+    "clock_type":"12h",
+    "cpu_temp_unit":"C"
   },
-  "volumio": {
-    "wait_timeout_seconds": 8
+  "volumio":{
+    "wait_timeout_seconds":8.0
   },
-  "debug": {
-    "enabled": true,
-    "log_path": "/var/log/volumio-clock-fb.log",
-    "max_bytes": 262144
+  "debug":{
+    "enabled":false,
+    "log_path":"/var/log/volumio_fbd.log",
+    "max_bytes":262144
   }
 }
