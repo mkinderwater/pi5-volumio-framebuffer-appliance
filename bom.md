@@ -2,7 +2,7 @@
 
 Project: Raspberry Pi 5 Volumio appliance with PoE, M.2 NVMe storage, DAC output, LCD framebuffer display, NIC relief, H/R/L DAC labels, and side sticky-foot pads.
 
-Base design file: `case-base-fits-perfect-nic-labels-feet.scad`
+Base design file: `case-v5.4.scad`
 
 The working base is the fit-good 2026-05-15 SCAD geometry with these add-ons retained:
 
