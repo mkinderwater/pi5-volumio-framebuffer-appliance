@@ -80,7 +80,8 @@
 #define DEFAULT_DEBUG_LOG_PATH "/var/log/volumio_fbd.log"
 #define DEFAULT_DEBUG_LOG_MAX_BYTES (256 * 1024)
 #define DEFAULT_WAIT_TIMEOUT_SECONDS 8.0
-#define DEFAULT_ALBUM_ART_DELAY_SECONDS 1.5
+#define DEFAULT_ALBUM_ART_LOOKUP_DELAY_SECONDS 5.0
+#define DEFAULT_ALBUM_ART_RECHECK_SECONDS 5.0
 
 // ---------------- Runtime State ----------------
 
@@ -93,6 +94,8 @@ static int g_cfg_height = DESIGN_HEIGHT;
 static bool g_cfg_clock_24h = false; // false = 12h, true = 24h
 static char g_cfg_cpu_temp_unit = 'C';
 static double g_cfg_wait_timeout_seconds = DEFAULT_WAIT_TIMEOUT_SECONDS;
+static double g_cfg_album_art_lookup_delay_seconds = DEFAULT_ALBUM_ART_LOOKUP_DELAY_SECONDS;
+static double g_cfg_album_art_recheck_seconds = DEFAULT_ALBUM_ART_RECHECK_SECONDS;
 static bool g_cfg_debug_enabled = false;
 static char g_cfg_debug_log_path[256] = DEFAULT_DEBUG_LOG_PATH;
 static long g_cfg_debug_log_max_bytes = DEFAULT_DEBUG_LOG_MAX_BYTES;
@@ -141,10 +144,11 @@ static FT_Face g_font_bold = NULL;
 static FT_Face g_font_reg = NULL;
 
 #define GLYPH_ATLAS_MAX 64
-#define GLYPH_CACHE_CHARS 128
+#define GLYPH_CACHE_SLOTS 512
 
 typedef struct {
     bool valid;
+    uint32_t codepoint;
     int width;
     int height;
     int pitch;
@@ -158,7 +162,7 @@ typedef struct {
     bool used;
     FT_Face face;
     int pixel_size;
-    GlyphCacheEntry glyphs[GLYPH_CACHE_CHARS];
+    GlyphCacheEntry glyphs[GLYPH_CACHE_SLOTS];
 } GlyphAtlas;
 
 static GlyphAtlas g_glyph_atlases[GLYPH_ATLAS_MAX];
@@ -223,19 +227,41 @@ static double g_no_metadata_started_at = -1.0;
 static double g_status_fetch_failed_started_at = -1.0;
 static bool g_wait_timeout_latched = false;
 static double g_last_latch_log_at = -1.0;
+static double g_pause_timeout_started_at = -1.0;
+static bool g_pause_timeout_latched = false;
+static char g_pause_timeout_track_key[1024] = "";
+static double g_pause_timeout_last_log_at = -1.0;
 
 // Album art
 static uint8_t *g_art_rgba = NULL;
 static int g_art_w = 0;
 static int g_art_h = 0;
-static char g_art_loaded_url[512] = "";
-static char g_art_pending_key[1536] = "";
-static double g_art_pending_since = -1.0;
+static char g_art_loaded_url[1536] = "";
+static char g_art_loaded_track_key[1024] = "";
+static bool g_art_is_default_fallback = false;
+static bool g_art_is_pulse_fallback = false;
+static double g_art_last_check_at = -1.0;
+static char g_art_lookup_track_key[1024] = "";
+static double g_art_lookup_track_since = -1.0;
 
 // Scaled Album Art Cache (Optimization)
 static uint8_t *g_art_scaled_rgb = NULL;
 static int g_cached_art_w = 0;
 static int g_cached_art_h = 0;
+
+// Album-art update verification. The scaled cache is tied to this generation
+// so a changed g_art_rgba can never reuse the previous scaled bitmap.
+static unsigned long g_art_generation = 1;
+static unsigned long g_art_scaled_generation = 0;
+
+// Offscreen zoomed background layer. The album background is rendered here,
+// matted into black, then copied to g_img as one finished layer. This prevents
+// any later path from showing the unmatted background.
+static uint8_t *g_album_bg_rgb = NULL;
+static int g_album_bg_w = 0;
+static int g_album_bg_h = 0;
+static unsigned long g_album_bg_generation = 0;
+
 
 // ---------------- Fast Math ----------------
 
@@ -500,28 +526,86 @@ static void copy_json_string(char *dst, size_t dst_sz, json_object *root, const 
     else snprintf(dst, dst_sz, "%s", s);
 }
 
-static bool albumart_is_real_track_art(void) {
-    if (g_status_albumart[0] == '\0') return false;
+static void lower_trimmed_copy(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) return;
 
-    if (strcmp(g_status_albumart, "/albumart") == 0) return false;
+    snprintf(dst, dst_sz, "%s", src ? src : "");
+    trim_in_place(dst);
+    lower_ascii(dst);
+}
 
-    // Spotify can return a direct HTTPS CDN URL such as:
-    // https://i.scdn.co/image/...
-    // Treat that as real track art so the metadata latch does not suppress playback.
-    if (strncmp(g_status_albumart, "http://", 7) == 0 ||
-        strncmp(g_status_albumart, "https://", 8) == 0) {
+static bool string_ends_with(const char *s, const char *suffix) {
+    if (!s || !suffix) return false;
+
+    size_t s_len = strlen(s);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len > s_len) return false;
+
+    return strcmp(s + s_len - suffix_len, suffix) == 0;
+}
+
+static bool albumart_source_names_default(const char *src) {
+    char tmp[640];
+    lower_trimmed_copy(tmp, sizeof(tmp), src);
+
+    if (strstr(tmp, "default") != NULL) return true;
+    if (strstr(tmp, "placeholder") != NULL) return true;
+    if (strstr(tmp, "nocover") != NULL) return true;
+    if (strstr(tmp, "no-cover") != NULL) return true;
+    if (strstr(tmp, "noart") != NULL) return true;
+    if (strstr(tmp, "no-art") != NULL) return true;
+    if (strstr(tmp, "unknown") != NULL) return true;
+
+    return false;
+}
+
+static bool albumart_source_is_placeholder(const char *src) {
+    char tmp[640];
+    lower_trimmed_copy(tmp, sizeof(tmp), src);
+
+    if (tmp[0] == '\0') return true;
+
+    if (strcmp(tmp, "/albumart") == 0 || strcmp(tmp, "albumart") == 0) return true;
+    if (strcmp(tmp, "/albumart/") == 0 || strcmp(tmp, "albumart/") == 0) return true;
+
+    if ((strncmp(tmp, "/albumart?", 10) == 0 || strncmp(tmp, "albumart?", 9) == 0) &&
+        strstr(tmp, "cacheid=") == NULL &&
+        strstr(tmp, "path=") == NULL &&
+        strstr(tmp, "web=") == NULL) {
         return true;
     }
 
-    if (strchr(g_status_albumart, '?') != NULL) return true;
-    if (strstr(g_status_albumart, "cacheid=") != NULL) return true;
-    if (strstr(g_status_albumart, "path=") != NULL) return true;
-    if (strstr(g_status_albumart, "web=") != NULL) return true;
-
-    if (strncmp(g_status_albumart, "/albumart/", 10) == 0) return true;
-    if (strncmp(g_status_albumart, "albumart/", 9) == 0) return true;
+    if (albumart_source_names_default(tmp)) return true;
 
     return false;
+}
+
+static bool albumart_source_is_specific(const char *src) {
+    char tmp[640];
+    lower_trimmed_copy(tmp, sizeof(tmp), src);
+
+    if (albumart_source_is_placeholder(tmp)) return false;
+
+    if (strncmp(tmp, "http://", 7) == 0 || strncmp(tmp, "https://", 8) == 0) return true;
+
+    if (strstr(tmp, "cacheid=") != NULL) return true;
+    if (strstr(tmp, "path=") != NULL) return true;
+    if (strstr(tmp, "web=") != NULL) return true;
+
+    if (strncmp(tmp, "/albumart/", 10) == 0) return true;
+    if (strncmp(tmp, "albumart/", 9) == 0) return true;
+
+    if (string_ends_with(tmp, ".jpg") || string_ends_with(tmp, ".jpeg") ||
+        string_ends_with(tmp, ".png") || string_ends_with(tmp, ".webp")) {
+        return true;
+    }
+
+    return false;
+}
+
+
+static bool albumart_is_real_track_art(void) {
+    return albumart_source_is_specific(g_status_albumart);
 }
 
 static bool state_has_track_payload(void) {
@@ -532,8 +616,16 @@ static bool state_has_track_payload(void) {
            albumart_is_real_track_art();
 }
 
-static bool state_shows_metadata(void) {
+static bool source_state_shows_metadata(void) {
     return strcmp(g_status_state, "play") == 0 || strcmp(g_status_state, "pause") == 0;
+}
+
+static bool state_shows_metadata(void) {
+    if (g_pause_timeout_latched && strcmp(g_status_state, "pause") == 0) {
+        return false;
+    }
+
+    return source_state_shows_metadata();
 }
 
 static void free_scaled_art(void) {
@@ -543,11 +635,70 @@ static void free_scaled_art(void) {
     }
     g_cached_art_w = 0;
     g_cached_art_h = 0;
+    g_art_scaled_generation = 0;
 }
 
-static void reset_album_art_delay(void) {
-    g_art_pending_key[0] = '\0';
-    g_art_pending_since = -1.0;
+static void mark_album_art_changed(const char *reason) {
+    g_art_generation++;
+    if (g_art_generation == 0) g_art_generation = 1;
+
+    free_scaled_art();
+    g_album_bg_generation = 0;
+    g_prev_frame_valid = false;
+
+    DBG_LOG("Album art dirty: reason=%s generation=%lu url='%s' track='%s' fallback=%s",
+            reason ? reason : "unknown",
+            g_art_generation,
+            g_art_loaded_url,
+            g_art_loaded_track_key,
+            g_art_is_default_fallback ? (g_art_is_pulse_fallback ? "pulse" : "true") : "false");
+}
+
+static void reset_album_art_lookup_timing(void) {
+    g_art_last_check_at = -1.0;
+    g_art_lookup_track_key[0] = '\0';
+    g_art_lookup_track_since = -1.0;
+}
+
+static void build_current_track_key(char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+
+    snprintf(dst, dst_sz, "%s|%s|%s|%d",
+             g_status_title,
+             g_status_artist,
+             g_status_album,
+             g_status_duration);
+}
+
+static bool current_track_has_identity(void) {
+    return g_status_title[0] != '\0' ||
+           g_status_artist[0] != '\0' ||
+           g_status_album[0] != '\0' ||
+           g_status_duration > 0;
+}
+
+static void clear_album_art_pixels(void) {
+    bool had_art_state = g_art_rgba || g_art_scaled_rgb ||
+                         g_art_w > 0 || g_art_h > 0 ||
+                         g_art_loaded_url[0] || g_art_loaded_track_key[0] ||
+                         g_art_is_default_fallback || g_art_is_pulse_fallback;
+
+    if (g_art_rgba) {
+        stbi_image_free(g_art_rgba);
+        g_art_rgba = NULL;
+    }
+
+    g_art_w = 0;
+    g_art_h = 0;
+    g_art_loaded_url[0] = '\0';
+    g_art_loaded_track_key[0] = '\0';
+    g_art_is_default_fallback = false;
+
+    if (had_art_state) {
+        mark_album_art_changed("cleared");
+    } else {
+        free_scaled_art();
+    }
 }
 
 static void force_large_clock_state(const char *reason) {
@@ -565,16 +716,16 @@ static void force_large_clock_state(const char *reason) {
     g_status_samplerate[0] = '\0';
     g_status_bitdepth[0] = '\0';
     g_art_loaded_url[0] = '\0';
-    reset_album_art_delay();
+    g_art_last_check_at = -1.0;
     g_no_metadata_started_at = -1.0;
     g_status_fetch_failed_started_at = -1.0;
     g_wait_timeout_latched = true;
+    g_pause_timeout_started_at = -1.0;
+    g_pause_timeout_latched = false;
+    g_pause_timeout_track_key[0] = '\0';
+    g_pause_timeout_last_log_at = -1.0;
 
-    if (g_art_rgba) {
-        stbi_image_free(g_art_rgba);
-        g_art_rgba = NULL;
-    }
-    free_scaled_art();
+    clear_album_art_pixels();
     free_scroll_strip();
 }
 
@@ -589,20 +740,20 @@ static void clear_track_payload_only(void) {
     g_status_samplerate[0] = '\0';
     g_status_bitdepth[0] = '\0';
     g_art_loaded_url[0] = '\0';
-    reset_album_art_delay();
+    g_art_last_check_at = -1.0;
+    g_pause_timeout_started_at = -1.0;
+    g_pause_timeout_latched = false;
+    g_pause_timeout_track_key[0] = '\0';
+    g_pause_timeout_last_log_at = -1.0;
 
-    if (g_art_rgba) {
-        stbi_image_free(g_art_rgba);
-        g_art_rgba = NULL;
-    }
-    free_scaled_art();
+    clear_album_art_pixels();
     free_scroll_strip();
 }
 
 static bool suppress_metadata_less_playback_if_latched(double now) {
     if (!g_wait_timeout_latched) return false;
 
-    if (state_shows_metadata() && !state_has_track_payload()) {
+    if (source_state_shows_metadata() && !state_has_track_payload()) {
         if (g_last_latch_log_at < 0.0 || now - g_last_latch_log_at >= 5.0) {
             DBG_LOG("Wait-timeout latch active: suppressing metadata-less playback state=%s albumart='%s'",
                     g_status_state, g_status_albumart);
@@ -625,13 +776,75 @@ static bool suppress_metadata_less_playback_if_latched(double now) {
     return false;
 }
 
+static void reset_pause_timeout_state(void) {
+    g_pause_timeout_started_at = -1.0;
+    g_pause_timeout_latched = false;
+    g_pause_timeout_track_key[0] = '\0';
+    g_pause_timeout_last_log_at = -1.0;
+}
+
+static void apply_pause_timeout(double now) {
+    if (g_cfg_wait_timeout_seconds <= 0.0) {
+        reset_pause_timeout_state();
+        return;
+    }
+
+    if (strcmp(g_status_state, "pause") != 0) {
+        reset_pause_timeout_state();
+        return;
+    }
+
+    char track_key[sizeof(g_pause_timeout_track_key)];
+    build_current_track_key(track_key, sizeof(track_key));
+
+    if (track_key[0] == '\0' || strcmp(track_key, "|||0") == 0) {
+        snprintf(track_key, sizeof(track_key), "pause|%s|%s|%d",
+                 g_status_albumart, g_status_track_type, g_status_seek);
+    }
+
+    if (g_pause_timeout_started_at < 0.0 || strcmp(track_key, g_pause_timeout_track_key) != 0) {
+        snprintf(g_pause_timeout_track_key, sizeof(g_pause_timeout_track_key), "%s", track_key);
+        g_pause_timeout_started_at = now;
+        g_pause_timeout_latched = false;
+        g_pause_timeout_last_log_at = -1.0;
+
+        DBG_LOG("Pause timeout timer started: state=%s title='%s' source='%s' limit=%.2f",
+                g_status_state, g_status_title, g_status_track_type, g_cfg_wait_timeout_seconds);
+        return;
+    }
+
+    if (g_pause_timeout_latched) {
+        if (g_pause_timeout_last_log_at < 0.0 || now - g_pause_timeout_last_log_at >= 5.0) {
+            DBG_LOG("Pause timeout latch active: suppressing paused metadata title='%s' source='%s'",
+                    g_status_title, g_status_track_type);
+            g_pause_timeout_last_log_at = now;
+        }
+        return;
+    }
+
+    if (now - g_pause_timeout_started_at >= g_cfg_wait_timeout_seconds) {
+        g_pause_timeout_latched = true;
+        g_pause_timeout_last_log_at = now;
+        DBG_LOG("Pause timeout reached: returning display to large clock title='%s' source='%s' elapsed=%.2f",
+                g_status_title, g_status_track_type, now - g_pause_timeout_started_at);
+    }
+}
+
 static void apply_wait_timeout(double now) {
     if (g_cfg_wait_timeout_seconds <= 0.0) {
+        g_no_metadata_started_at = -1.0;
+        reset_pause_timeout_state();
+        return;
+    }
+
+    apply_pause_timeout(now);
+
+    if (g_pause_timeout_latched && strcmp(g_status_state, "pause") == 0) {
         g_no_metadata_started_at = -1.0;
         return;
     }
 
-    if (state_shows_metadata() && !state_has_track_payload()) {
+    if (source_state_shows_metadata() && !state_has_track_payload()) {
         if (g_no_metadata_started_at < 0.0) {
             g_no_metadata_started_at = now;
             DBG_LOG("No metadata while in playback state. timeout_started state=%s limit=%.2f",
@@ -829,6 +1042,8 @@ static bool create_default_json_config(void) {
     json_object_object_add(display, "cpu_temp_unit", json_object_new_string(temp_unit));
 
     json_object_object_add(volumio, "wait_timeout_seconds", json_object_new_double(g_cfg_wait_timeout_seconds));
+    json_object_object_add(volumio, "album_art_delay_seconds", json_object_new_double(g_cfg_album_art_lookup_delay_seconds));
+    json_object_object_add(volumio, "album_art_recheck_seconds", json_object_new_double(g_cfg_album_art_recheck_seconds));
 
     json_object_object_add(debug, "enabled", json_object_new_boolean(g_cfg_debug_enabled));
     json_object_object_add(debug, "log_path", json_object_new_string(g_cfg_debug_log_path));
@@ -960,6 +1175,31 @@ static void load_json_config(void) {
         if (json_object_object_get_ex(volumio_obj, "no_metadata_timeout_seconds", &v) && v) {
             double timeout = json_object_get_double(v);
             if (timeout >= 0.0) g_cfg_wait_timeout_seconds = timeout;
+        }
+
+        if (json_object_object_get_ex(volumio_obj, "album_art_delay_seconds", &v) && v) {
+            double delay = json_object_get_double(v);
+            if (delay >= 0.0) g_cfg_album_art_lookup_delay_seconds = delay;
+        }
+
+        if (json_object_object_get_ex(volumio_obj, "album_art_lookup_delay_seconds", &v) && v) {
+            double delay = json_object_get_double(v);
+            if (delay >= 0.0) g_cfg_album_art_lookup_delay_seconds = delay;
+        }
+
+        if (json_object_object_get_ex(volumio_obj, "art_lookup_delay_seconds", &v) && v) {
+            double delay = json_object_get_double(v);
+            if (delay >= 0.0) g_cfg_album_art_lookup_delay_seconds = delay;
+        }
+
+        if (json_object_object_get_ex(volumio_obj, "album_art_recheck_seconds", &v) && v) {
+            double recheck = json_object_get_double(v);
+            if (recheck >= 0.25) g_cfg_album_art_recheck_seconds = recheck;
+        }
+
+        if (json_object_object_get_ex(volumio_obj, "art_recheck_seconds", &v) && v) {
+            double recheck = json_object_get_double(v);
+            if (recheck >= 0.25) g_cfg_album_art_recheck_seconds = recheck;
         }
     }
 
@@ -1211,6 +1451,13 @@ static uint8_t *decode_chunked_body(const uint8_t *body, size_t body_len, size_t
     }
 
     out[used] = '\0';
+
+    // Shrink the temporary chunk buffer before returning. The decoded body is
+    // never larger than the encoded chunked body, so this avoids keeping the
+    // oversized HTTP receive allocation around after decoding.
+    uint8_t *shrunk = realloc(out, used + 1);
+    if (shrunk) out = shrunk;
+
     if (out_len) *out_len = used;
     return out;
 }
@@ -1401,135 +1648,307 @@ static int build_album_art_candidates(char paths[][2048], int max_count, const c
     if (!paths || max_count <= 0) return 0;
 
     int count = 0;
+    char path[2048];
+
     for (int i = 0; i < max_count; i++) paths[i][0] = '\0';
+    if (!albumart_source_is_specific(src)) return 0;
 
-    if (!src || !*src) return 0;
-
-    if (strncmp(src, "http://127.0.0.1:3000", 21) == 0) {
-        snprintf(paths[count++], 2048, "%s", src + 21);
-        return count;
-    }
-
-    if (strncmp(src, "http://localhost:3000", 21) == 0) {
+    if (strncmp(src, "http://127.0.0.1:3000", 21) == 0 ||
+        strncmp(src, "http://localhost:3000", 21) == 0) {
         snprintf(paths[count++], 2048, "%s", src + 21);
         return count;
     }
 
     if (strncmp(src, "http://", 7) == 0 || strncmp(src, "https://", 8) == 0) {
-        if (build_metadata_albumart_path(paths[count], 2048)) count++;
+        if (build_metadata_albumart_path(path, sizeof(path)) && count < max_count) {
+            snprintf(paths[count++], 2048, "%s", path);
+        }
 
         if (count < max_count) {
             snprintf(paths[count++], 2048, "/albumart?web=%s", src);
         }
 
+        char web_url[1536];
+        url_query_component(web_url, sizeof(web_url), src);
+        if (web_url[0] && count < max_count) {
+            snprintf(paths[count++], 2048, "/albumart?web=%s", web_url);
+        }
+
         return count;
     }
 
-    if (src[0] == '/') snprintf(paths[count++], 2048, "%s", src);
-    else snprintf(paths[count++], 2048, "/%s", src);
-
+    snprintf(paths[count++], 2048, "%s%s", src[0] == '/' ? "" : "/", src);
     return count;
 }
 
-static void update_album_art_if_needed(void) {
-    if (!state_shows_metadata() || g_status_albumart[0] == '\0') {
-        if (g_art_rgba) {
-            DBG_LOG("Album art cleared: state=%s albumart='%s'", g_status_state, g_status_albumart);
-            stbi_image_free(g_art_rgba);
-            g_art_rgba = NULL;
-            free_scaled_art();
+
+static void rgba_put_pixel(uint8_t *rgba, int w, int h, int x, int y, uint32_t color) {
+    if (!rgba || x < 0 || y < 0 || x >= w || y >= h) return;
+
+    size_t idx = ((size_t)y * (size_t)w + (size_t)x) * 4;
+    rgba[idx + 0] = (uint8_t)((color >> 16) & 0xFF);
+    rgba[idx + 1] = (uint8_t)((color >> 8) & 0xFF);
+    rgba[idx + 2] = (uint8_t)(color & 0xFF);
+    rgba[idx + 3] = 255;
+}
+
+static void rgba_fill_rect(uint8_t *rgba, int w, int h, int x, int y, int rw, int rh, uint32_t color) {
+    if (!rgba || rw <= 0 || rh <= 0) return;
+
+    int x0 = clamp_int(x, 0, w);
+    int y0 = clamp_int(y, 0, h);
+    int x1 = clamp_int(x + rw, 0, w);
+    int y1 = clamp_int(y + rh, 0, h);
+
+    for (int yy = y0; yy < y1; yy++) {
+        for (int xx = x0; xx < x1; xx++) {
+            rgba_put_pixel(rgba, w, h, xx, yy, color);
         }
-        g_art_loaded_url[0] = '\0';
-        reset_album_art_delay();
+    }
+}
+
+static void rgba_fill_circle(uint8_t *rgba, int w, int h, int cx, int cy, int radius, uint32_t color) {
+    if (!rgba || radius <= 0) return;
+
+    int r2 = radius * radius;
+    int x0 = clamp_int(cx - radius, 0, w - 1);
+    int x1 = clamp_int(cx + radius, 0, w - 1);
+    int y0 = clamp_int(cy - radius, 0, h - 1);
+    int y1 = clamp_int(cy + radius, 0, h - 1);
+
+    for (int y = y0; y <= y1; y++) {
+        int dy = y - cy;
+        for (int x = x0; x <= x1; x++) {
+            int dx = x - cx;
+            if ((dx * dx) + (dy * dy) <= r2) {
+                rgba_put_pixel(rgba, w, h, x, y, color);
+            }
+        }
+    }
+}
+
+static void activate_pulse_album_art_fallback(const char *track_key, const char *reason) {
+    if (!track_key || !*track_key) return;
+
+    if (g_art_is_default_fallback &&
+        g_art_is_pulse_fallback &&
+        !g_art_rgba &&
+        strcmp(track_key, g_art_loaded_track_key) == 0) {
+        return;
+    }
+
+    clear_album_art_pixels();
+
+    snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "__pulse_default_fallback__|%s", track_key);
+    snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
+    g_art_is_default_fallback = true;
+    g_art_is_pulse_fallback = true;
+    mark_album_art_changed("pulse fallback loaded");
+
+    DBG_LOG("Pulse default album art fallback loaded: reason=%s track='%s' generation=%lu",
+            reason ? reason : "unknown", track_key, g_art_generation);
+}
+
+static void load_default_album_art_fallback(const char *track_key, const char *reason, bool allow_volumio_http) {
+    if (!track_key || !*track_key) return;
+
+    if (!allow_volumio_http) {
+        activate_pulse_album_art_fallback(track_key, reason);
+        return;
+    }
+
+    if (g_art_is_default_fallback &&
+        !g_art_is_pulse_fallback &&
+        g_art_rgba &&
+        strcmp(track_key, g_art_loaded_track_key) == 0 &&
+        strncmp(g_art_loaded_url, "__volumio_default_fallback__", 28) == 0) {
+        return;
+    }
+
+    close_http_keepalive();
+
+    size_t img_len = 0;
+    uint8_t *img_data = http_get_localhost_body_keepalive("/albumart", "image/*", &img_len);
+
+    if (img_data && img_len > 0) {
+        int art_w = 0;
+        int art_h = 0;
+        int comp = 0;
+        uint8_t *fallback_art = stbi_load_from_memory(img_data, (int)img_len, &art_w, &art_h, &comp, 4);
+        free(img_data);
+
+        if (fallback_art && art_w > 0 && art_h > 0) {
+            clear_album_art_pixels();
+
+            g_art_rgba = fallback_art;
+            g_art_w = art_w;
+            g_art_h = art_h;
+            snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "__volumio_default_fallback__|%s", track_key);
+            snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
+            g_art_is_default_fallback = true;
+            g_art_is_pulse_fallback = false;
+            mark_album_art_changed("volumio fallback loaded");
+
+            DBG_LOG("Volumio default album art fallback loaded: reason=%s bytes=%zu size=%dx%d track='%s' generation=%lu",
+                    reason ? reason : "unknown", img_len, g_art_w, g_art_h, track_key, g_art_generation);
+            return;
+        }
+
+        if (fallback_art) stbi_image_free(fallback_art);
+        DBG_LOG("Volumio default album art fallback decode failed: reason=%s bytes=%zu track='%s'",
+                reason ? reason : "unknown", img_len, track_key);
+    } else {
+        free(img_data);
+        DBG_LOG("Volumio default album art fallback unavailable: reason=%s track='%s'",
+                reason ? reason : "unknown", track_key);
+    }
+
+    activate_pulse_album_art_fallback(track_key, reason);
+}
+
+static bool album_art_track_stable_for_lookup(const char *track_key, double now) {
+    if (!track_key || !*track_key) return false;
+
+    if (strcmp(track_key, g_art_lookup_track_key) != 0) {
+        snprintf(g_art_lookup_track_key, sizeof(g_art_lookup_track_key), "%s", track_key);
+        g_art_lookup_track_since = now;
+        g_art_last_check_at = -1.0;
+
+        DBG_LOG("Album art lookup delayed: track='%s' delay=%.2f", track_key, g_cfg_album_art_lookup_delay_seconds);
+        return g_cfg_album_art_lookup_delay_seconds <= 0.0;
+    }
+
+    if (g_art_lookup_track_since < 0.0) {
+        g_art_lookup_track_since = now;
+        return g_cfg_album_art_lookup_delay_seconds <= 0.0;
+    }
+
+    return (now - g_art_lookup_track_since) >= g_cfg_album_art_lookup_delay_seconds;
+}
+
+static void update_album_art_if_needed(void) {
+    char track_key[1024];
+    build_current_track_key(track_key, sizeof(track_key));
+    double now = monotonic_seconds();
+
+    if (!source_state_shows_metadata() || !current_track_has_identity()) {
+        if (g_art_rgba) {
+            DBG_LOG("Album art cleared: state=%s title='%s' albumart='%s'",
+                    g_status_state, g_status_title, g_status_albumart);
+        }
+
+        clear_album_art_pixels();
+        reset_album_art_lookup_timing();
+        return;
+    }
+
+    if (strcmp(track_key, g_art_lookup_track_key) != 0) {
+        DBG_LOG("Album art track changed: old='%s' new='%s' albumart='%s'",
+                g_art_lookup_track_key, track_key, g_status_albumart);
+        clear_album_art_pixels();
+        g_art_last_check_at = -1.0;
+    }
+
+    // Display-only fallback. It prevents blank art, but it never stops the real
+    // lookup timer or retry loop.
+    if (!g_art_rgba) {
+        load_default_album_art_fallback(track_key, "waiting for stable artwork lookup", false);
+    }
+
+    // Fast skipping protection: do not touch Volumio artwork endpoints until the
+    // same track identity has remained stable for the configured delay.
+    if (!album_art_track_stable_for_lookup(track_key, now)) {
+        return;
+    }
+
+    if (!albumart_source_is_specific(g_status_albumart)) {
+        if (g_art_last_check_at < 0.0 || now - g_art_last_check_at >= g_cfg_album_art_recheck_seconds) {
+            g_art_last_check_at = now;
+            DBG_LOG("Album art source not specific yet: raw='%s' track='%s' recheck=%.2f",
+                    g_status_albumart, track_key, g_cfg_album_art_recheck_seconds);
+        }
         return;
     }
 
     char art_cache_key[1536];
-    snprintf(art_cache_key, sizeof(art_cache_key), "%s|%s|%s|%s|%d",
-             g_status_albumart,
-             g_status_title,
-             g_status_artist,
-             g_status_album,
-             g_status_duration);
+    snprintf(art_cache_key, sizeof(art_cache_key), "%s|%s", g_status_albumart, track_key);
 
-    if (strcmp(art_cache_key, g_art_loaded_url) == 0 && g_art_rgba) return;
-
-    double now = monotonic_seconds();
-
-    if (strcmp(art_cache_key, g_art_pending_key) != 0) {
-        snprintf(g_art_pending_key, sizeof(g_art_pending_key), "%s", art_cache_key);
-        g_art_pending_since = now;
-
-        if (g_art_rgba) {
-            DBG_LOG("Album art delayed: clearing previous art while waiting for stable Volumio artwork");
-            stbi_image_free(g_art_rgba);
-            g_art_rgba = NULL;
-            free_scaled_art();
-        }
-
+    if (!g_art_is_default_fallback &&
+        strcmp(art_cache_key, g_art_loaded_url) == 0 &&
+        strcmp(track_key, g_art_loaded_track_key) == 0 &&
+        g_art_rgba) {
         return;
     }
 
-    if (g_art_pending_since >= 0.0 && now - g_art_pending_since < DEFAULT_ALBUM_ART_DELAY_SECONDS) {
+
+    if (g_art_last_check_at >= 0.0 &&
+        now - g_art_last_check_at < g_cfg_album_art_recheck_seconds) {
         return;
     }
 
-    char art_paths[2][2048];
-    int art_path_count = build_album_art_candidates(art_paths, 2, g_status_albumart);
+    g_art_last_check_at = now;
+
+    char art_paths[3][2048];
+    int art_path_count = build_album_art_candidates(art_paths, 3, g_status_albumart);
 
     if (art_path_count <= 0) {
-        DBG_LOG("Album art path unsupported: raw='%s'", g_status_albumart);
-        if (g_art_rgba) {
-            stbi_image_free(g_art_rgba);
-            g_art_rgba = NULL;
-            free_scaled_art();
-        }
-        g_art_loaded_url[0] = '\0';
+        DBG_LOG("Album art path unsupported: raw='%s' track='%s'", g_status_albumart, track_key);
+        load_default_album_art_fallback(track_key, "no artwork candidates", true);
         return;
     }
 
-    if (g_art_rgba) {
-        stbi_image_free(g_art_rgba);
-        g_art_rgba = NULL;
-        free_scaled_art();
-    }
-
-    bool loaded = false;
-
-    for (int i = 0; i < art_path_count && !loaded; i++) {
+    for (int i = 0; i < art_path_count; i++) {
         const char *art_path = art_paths[i];
         if (!art_path || !*art_path) continue;
+
+        DBG_LOG("Album art candidate fetch: candidate=%d/%d path=%s track='%s'",
+                i + 1, art_path_count, art_path, track_key);
 
         close_http_keepalive();
 
         size_t img_len = 0;
         uint8_t *img_data = http_get_localhost_body_keepalive(art_path, "image/*", &img_len);
 
-        if (img_data && img_len > 0) {
-            int comp = 0;
-            g_art_rgba = stbi_load_from_memory(img_data, (int)img_len, &g_art_w, &g_art_h, &comp, 4);
-            if (g_art_rgba) {
-                snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "%s", art_cache_key);
-                reset_album_art_delay();
-                loaded = true;
-                DBG_LOG("Album art loaded: candidate=%d path=%s bytes=%zu size=%dx%d",
-                        i + 1, art_path, img_len, g_art_w, g_art_h);
-            } else {
-                DBG_LOG("Album art decode failed: candidate=%d path=%s bytes=%zu", i + 1, art_path, img_len);
-            }
-        } else {
+        if (!img_data || img_len == 0) {
             DBG_LOG("Album art download failed: candidate=%d path=%s", i + 1, art_path);
+            free(img_data);
+            continue;
         }
 
+        int art_w = 0;
+        int art_h = 0;
+        int comp = 0;
+        uint8_t *new_art = stbi_load_from_memory(img_data, (int)img_len, &art_w, &art_h, &comp, 4);
         free(img_data);
+
+        if (!new_art || art_w <= 0 || art_h <= 0) {
+            if (new_art) stbi_image_free(new_art);
+            DBG_LOG("Album art decode failed: candidate=%d path=%s bytes=%zu", i + 1, art_path, img_len);
+            continue;
+        }
+
+        clear_album_art_pixels();
+
+        g_art_rgba = new_art;
+        g_art_w = art_w;
+        g_art_h = art_h;
+        snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "%s", art_cache_key);
+        snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
+        g_art_is_default_fallback = false;
+        g_art_is_pulse_fallback = false;
+        mark_album_art_changed("real art loaded");
+        g_art_last_check_at = -1.0;
+
+        DBG_LOG("Album art loaded: candidate=%d path=%s bytes=%zu size=%dx%d track='%s' generation=%lu",
+                i + 1, art_path, img_len, g_art_w, g_art_h, track_key, g_art_generation);
+        return;
     }
 
-    if (!loaded) {
-        g_art_loaded_url[0] = '\0';
-        g_art_w = 0;
-        g_art_h = 0;
-        free_scaled_art();
-    }
+    // Keep fallback visible and retry real candidates later. Volumio default is
+    // delayed until after candidate failure so /albumart is not touched during
+    // source startup.
+    g_art_loaded_url[0] = '\0';
+    load_default_album_art_fallback(track_key, "specific artwork unavailable", true);
 }
 
 
@@ -1573,25 +1992,51 @@ static bool json_value_to_volume_int(json_object *obj, int *out_volume) {
     return false;
 }
 
-static bool extract_volume_from_state(json_object *root, int *out_volume) {
-    if (!root || !out_volume) return false;
+static bool json_key_suggests_volume(const char *key) {
+    if (!key || !*key) return false;
 
-    static const char *keys[] = {
-        "volume",
-        "vol",
-        "Volume",
-        "airplayVolume",
-        "airplay_volume"
-    };
+    char tmp[128];
+    lower_trimmed_copy(tmp, sizeof(tmp), key);
 
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        json_object *val = NULL;
-        if (json_object_object_get_ex(root, keys[i], &val) && val) {
-            if (json_value_to_volume_int(val, out_volume)) return true;
+    return strcmp(tmp, "volume") == 0 ||
+           strcmp(tmp, "vol") == 0 ||
+           string_ends_with(tmp, "volume") ||
+           string_ends_with(tmp, "_vol") ||
+           string_ends_with(tmp, "-vol");
+}
+
+static bool extract_volume_recursive(json_object *obj, int *out_volume, int depth) {
+    if (!obj || !out_volume || depth > 3) return false;
+
+    json_type type = json_object_get_type(obj);
+
+    if (type == json_type_object) {
+        {
+            json_object_object_foreach(obj, key, val) {
+                if (json_key_suggests_volume(key) && json_value_to_volume_int(val, out_volume)) {
+                    return true;
+                }
+            }
+        }
+
+        {
+            json_object_object_foreach(obj, key, val) {
+                (void)key;
+                if (extract_volume_recursive(val, out_volume, depth + 1)) return true;
+            }
+        }
+    } else if (type == json_type_array) {
+        int n = json_object_array_length(obj);
+        for (int i = 0; i < n; i++) {
+            if (extract_volume_recursive(json_object_array_get_idx(obj, i), out_volume, depth + 1)) return true;
         }
     }
 
     return false;
+}
+
+static bool extract_volume_from_state(json_object *root, int *out_volume) {
+    return extract_volume_recursive(root, out_volume, 0);
 }
 
 static void note_volume_state(int new_volume, double now) {
@@ -1630,7 +2075,7 @@ static void update_volumio_state(void) {
     if (!body) {
         DBG_LOG("Volumio state fetch failed");
 
-        if (g_cfg_wait_timeout_seconds > 0.0 && state_shows_metadata() && !state_has_track_payload()) {
+        if (g_cfg_wait_timeout_seconds > 0.0 && source_state_shows_metadata() && !state_has_track_payload()) {
             if (g_status_fetch_failed_started_at < 0.0) {
                 g_status_fetch_failed_started_at = now;
             }
@@ -1747,8 +2192,8 @@ static void free_glyph_entry(GlyphCacheEntry *g) {
 
 static void free_font_atlases(void) {
     for (size_t a = 0; a < g_glyph_atlas_count; a++) {
-        for (int ch = 0; ch < GLYPH_CACHE_CHARS; ch++) {
-            free_glyph_entry(&g_glyph_atlases[a].glyphs[ch]);
+        for (int slot = 0; slot < GLYPH_CACHE_SLOTS; slot++) {
+            free_glyph_entry(&g_glyph_atlases[a].glyphs[slot]);
         }
         memset(&g_glyph_atlases[a], 0, sizeof(g_glyph_atlases[a]));
     }
@@ -1776,29 +2221,65 @@ static GlyphAtlas *get_font_atlas(FT_Face face, int pixel_size, bool create) {
     return atlas;
 }
 
-static GlyphCacheEntry *cache_glyph(GlyphAtlas *atlas, unsigned char ch) {
-    if (!atlas || ch >= GLYPH_CACHE_CHARS) return NULL;
+static uint32_t glyph_hash_codepoint(uint32_t codepoint) {
+    codepoint ^= codepoint >> 16;
+    codepoint *= 0x7feb352dU;
+    codepoint ^= codepoint >> 15;
+    codepoint *= 0x846ca68bU;
+    codepoint ^= codepoint >> 16;
+    return codepoint;
+}
 
-    GlyphCacheEntry *entry = &atlas->glyphs[ch];
-    if (entry->valid) return entry;
+static GlyphCacheEntry *cache_glyph(GlyphAtlas *atlas, uint32_t codepoint) {
+    if (!atlas) return NULL;
+    if (codepoint == 0) codepoint = '?';
 
+    size_t slot = (size_t)(glyph_hash_codepoint(codepoint) & (GLYPH_CACHE_SLOTS - 1));
+    GlyphCacheEntry *entry = NULL;
+
+    for (size_t probe = 0; probe < GLYPH_CACHE_SLOTS; probe++) {
+        entry = &atlas->glyphs[(slot + probe) & (GLYPH_CACHE_SLOTS - 1)];
+
+        if (entry->valid && entry->codepoint == codepoint) {
+            return entry;
+        }
+
+        if (!entry->valid) {
+            break;
+        }
+    }
+
+    if (!entry) return NULL;
+
+    // Cache full. Evict the hashed slot. This keeps memory fixed and avoids
+    // heap growth on long titles with many unique Unicode characters.
+    if (entry->valid) {
+        free_glyph_entry(entry);
+    }
+
+    entry->codepoint = codepoint;
     FT_Set_Pixel_Sizes(atlas->face, 0, (FT_UInt)atlas->pixel_size);
 
-    if (FT_Load_Char(atlas->face, (FT_ULong)ch, FT_LOAD_RENDER) != 0) {
+    FT_Error err = FT_Load_Char(atlas->face, (FT_ULong)codepoint, FT_LOAD_RENDER);
+    if (err != 0 && codepoint != '?') {
+        err = FT_Load_Char(atlas->face, (FT_ULong)'?', FT_LOAD_RENDER);
+    }
+
+    if (err != 0) {
         entry->valid = true;
         entry->advance = atlas->pixel_size / 2;
         return entry;
     }
 
-    FT_GlyphSlot slot = atlas->face->glyph;
-    FT_Bitmap *bitmap = &slot->bitmap;
+    FT_GlyphSlot slot_glyph = atlas->face->glyph;
+    FT_Bitmap *bitmap = &slot_glyph->bitmap;
 
     entry->width = (int)bitmap->width;
     entry->height = (int)bitmap->rows;
     entry->pitch = entry->width;
-    entry->advance = (int)(slot->advance.x >> 6);
-    entry->left = slot->bitmap_left;
-    entry->top = slot->bitmap_top;
+    entry->advance = (int)(slot_glyph->advance.x >> 6);
+    entry->left = slot_glyph->bitmap_left;
+    entry->top = slot_glyph->bitmap_top;
     entry->valid = true;
 
     if (entry->width > 0 && entry->height > 0) {
@@ -1821,11 +2302,68 @@ static GlyphCacheEntry *cache_glyph(GlyphAtlas *atlas, unsigned char ch) {
     return entry;
 }
 
-static GlyphCacheEntry *get_cached_glyph(FT_Face face, unsigned char ch) {
+static GlyphCacheEntry *get_cached_glyph(FT_Face face, uint32_t codepoint) {
     int pixel_size = current_face_pixel_size(face);
     GlyphAtlas *atlas = get_font_atlas(face, pixel_size, true);
     if (!atlas) return NULL;
-    return cache_glyph(atlas, ch);
+    return cache_glyph(atlas, codepoint);
+}
+
+static uint32_t utf8_next_codepoint(const char *text, size_t len, size_t *idx) {
+    if (!text || !idx || *idx >= len) return 0;
+
+    const unsigned char *s = (const unsigned char *)text;
+    unsigned char c0 = s[*idx];
+
+    if (c0 < 0x80) {
+        (*idx)++;
+        return (uint32_t)c0;
+    }
+
+    uint32_t codepoint = 0;
+    size_t need = 0;
+
+    if ((c0 & 0xE0) == 0xC0) {
+        codepoint = (uint32_t)(c0 & 0x1F);
+        need = 1;
+        if (codepoint == 0) { (*idx)++; return 0xFFFD; } // overlong lead
+    } else if ((c0 & 0xF0) == 0xE0) {
+        codepoint = (uint32_t)(c0 & 0x0F);
+        need = 2;
+    } else if ((c0 & 0xF8) == 0xF0) {
+        codepoint = (uint32_t)(c0 & 0x07);
+        need = 3;
+    } else {
+        (*idx)++;
+        return 0xFFFD;
+    }
+
+    if (*idx + need >= len) {
+        (*idx)++;
+        return 0xFFFD;
+    }
+
+    size_t start = *idx;
+    for (size_t n = 1; n <= need; n++) {
+        unsigned char cx = s[start + n];
+        if ((cx & 0xC0) != 0x80) {
+            (*idx)++;
+            return 0xFFFD;
+        }
+        codepoint = (codepoint << 6) | (uint32_t)(cx & 0x3F);
+    }
+
+    *idx += need + 1;
+
+    if ((need == 1 && codepoint < 0x80) ||
+        (need == 2 && codepoint < 0x800) ||
+        (need == 3 && codepoint < 0x10000) ||
+        codepoint > 0x10FFFF ||
+        (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+        return 0xFFFD;
+    }
+
+    return codepoint;
 }
 
 static void warm_font_atlas(FT_Face face, int pixel_size) {
@@ -1919,9 +2457,9 @@ static void draw_text_clipped_alpha(FT_Face face, const char *text, int x_start,
     int x = x_start;
     size_t len = strlen(text);
 
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        GlyphCacheEntry *glyph = get_cached_glyph(face, ch);
+    for (size_t i = 0; i < len; ) {
+        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
+        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
 
         if (!glyph) continue;
 
@@ -1960,9 +2498,9 @@ static void draw_text_to_rgb_buffer(FT_Face face, const char *text,
     int x = x_start;
     size_t len = strlen(text);
 
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        GlyphCacheEntry *glyph = get_cached_glyph(face, ch);
+    for (size_t i = 0; i < len; ) {
+        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
+        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
         if (!glyph) continue;
 
         int x_p = x + glyph->left;
@@ -2043,9 +2581,9 @@ static int calculate_text_width(FT_Face face, const char *text) {
     int width = 0;
     size_t len = strlen(text);
 
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        GlyphCacheEntry *glyph = get_cached_glyph(face, ch);
+    for (size_t i = 0; i < len; ) {
+        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
+        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
         if (!glyph) continue;
         width += glyph->advance;
     }
@@ -2060,9 +2598,9 @@ static int text_top_offset_from_baseline(FT_Face face, const char *text) {
     bool seen = false;
     size_t len = strlen(text);
 
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        GlyphCacheEntry *glyph = get_cached_glyph(face, ch);
+    for (size_t i = 0; i < len; ) {
+        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
+        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
         if (!glyph) continue;
 
         int top = -glyph->top;
@@ -2204,11 +2742,24 @@ static void draw_scroll_strip_window(int dst_x, int dst_y, int clip_w, int clip_
     }
 }
 
+
+static inline uint8_t composite_channel_over_bg(uint8_t src, uint8_t alpha, uint8_t bg) {
+    if (alpha == 255) return src;
+    if (alpha == 0) return bg;
+    return fast_div_255((uint16_t)alpha * src + (uint16_t)(255 - alpha) * bg);
+}
+
 // Generates the scaled album art cache once
 static void scale_art_once(int target_w, int target_h) {
-    if (g_cached_art_w == target_w && g_cached_art_h == target_h && g_art_scaled_rgb) return;
+    if (g_cached_art_w == target_w &&
+        g_cached_art_h == target_h &&
+        g_art_scaled_rgb &&
+        g_art_scaled_generation == g_art_generation) {
+        return;
+    }
+
     free_scaled_art();
-    
+
     if (!g_art_rgba || g_art_w <= 0 || g_art_h <= 0 || target_w <= 0 || target_h <= 0) return;
 
     g_art_scaled_rgb = malloc((size_t)target_w * (size_t)target_h * 3);
@@ -2216,9 +2767,16 @@ static void scale_art_once(int target_w, int target_h) {
 
     g_cached_art_w = target_w;
     g_cached_art_h = target_h;
+    g_art_scaled_generation = g_art_generation;
 
     int x_step = (target_w > 1) ? (int)(((int64_t)(g_art_w - 1) << 16) / (target_w - 1)) : 0;
     int y_step = (target_h > 1) ? (int)(((int64_t)(g_art_h - 1) << 16) / (target_h - 1)) : 0;
+
+    const uint8_t bg[3] = {
+        (uint8_t)((BG_COLOR >> 16) & 0xFF),
+        (uint8_t)((BG_COLOR >> 8) & 0xFF),
+        (uint8_t)(BG_COLOR & 0xFF)
+    };
 
     int src_y_fp = 0;
 
@@ -2253,12 +2811,22 @@ static void scale_art_once(int target_w, int target_h) {
             size_t idx_01 = ((size_t)y1 * g_art_w + x0) * 4;
             size_t idx_11 = ((size_t)y1 * g_art_w + x1) * 4;
 
+            uint8_t a00 = g_art_rgba[idx_00 + 3];
+            uint8_t a10 = g_art_rgba[idx_10 + 3];
+            uint8_t a01 = g_art_rgba[idx_01 + 3];
+            uint8_t a11 = g_art_rgba[idx_11 + 3];
+
             for (int c = 0; c < 3; c++) {
+                uint8_t c00 = composite_channel_over_bg(g_art_rgba[idx_00 + c], a00, bg[c]);
+                uint8_t c10 = composite_channel_over_bg(g_art_rgba[idx_10 + c], a10, bg[c]);
+                uint8_t c01 = composite_channel_over_bg(g_art_rgba[idx_01 + c], a01, bg[c]);
+                uint8_t c11 = composite_channel_over_bg(g_art_rgba[idx_11 + c], a11, bg[c]);
+
                 uint64_t value =
-                    ((uint64_t)g_art_rgba[idx_00 + c] * w00) +
-                    ((uint64_t)g_art_rgba[idx_10 + c] * w10) +
-                    ((uint64_t)g_art_rgba[idx_01 + c] * w01) +
-                    ((uint64_t)g_art_rgba[idx_11 + c] * w11);
+                    ((uint64_t)c00 * w00) +
+                    ((uint64_t)c10 * w10) +
+                    ((uint64_t)c01 * w01) +
+                    ((uint64_t)c11 * w11);
 
                 g_art_scaled_rgb[dst_row_idx + (x * 3) + c] = (uint8_t)((value + (1ULL << 31)) >> 32);
             }
@@ -2266,6 +2834,9 @@ static void scale_art_once(int target_w, int target_h) {
         }
         src_y_fp += y_step;
     }
+
+    DBG_LOG("Album art scaled: generation=%lu target=%dx%d source=%dx%d",
+            g_art_scaled_generation, target_w, target_h, g_art_w, g_art_h);
 }
 
 // Blits pre-scaled cache directly to the frame 
@@ -2296,6 +2867,185 @@ static void draw_album_art_cached(int target_x, int target_y, int target_w, int 
             memcpy(&g_img[dst_idx], &g_art_scaled_rgb[src_idx], (size_t)copy_w * 3);
         }
     }
+}
+
+static void dim_rect_rgb_percent(int x, int y, int w, int h, uint8_t percent) {
+    if (!g_img || w <= 0 || h <= 0) return;
+    if (percent > 100) percent = 100;
+
+    int x0 = clamp_int(x, 0, g_width);
+    int y0 = clamp_int(y, 0, g_height);
+    int x1 = clamp_int(x + w, 0, g_width);
+    int y1 = clamp_int(y + h, 0, g_height);
+
+    if (x1 <= x0 || y1 <= y0) return;
+
+    for (int cy = y0; cy < y1; cy++) {
+        uint8_t *row = g_img + ((size_t)cy * (size_t)g_width + (size_t)x0) * 3u;
+        for (int cx = x0; cx < x1; cx++) {
+            row[0] = (uint8_t)(((unsigned int)row[0] * (unsigned int)percent) / 100u);
+            row[1] = (uint8_t)(((unsigned int)row[1] * (unsigned int)percent) / 100u);
+            row[2] = (uint8_t)(((unsigned int)row[2] * (unsigned int)percent) / 100u);
+            row += 3;
+        }
+    }
+}
+
+static bool ensure_album_background_layer(void) {
+    if (g_width <= 0 || g_height <= 0) return false;
+
+    size_t needed = (size_t)g_width * (size_t)g_height * 3u;
+    if (needed == 0) return false;
+
+    if (g_album_bg_rgb && g_album_bg_w == g_width && g_album_bg_h == g_height) {
+        return true;
+    }
+
+    uint8_t *new_layer = realloc(g_album_bg_rgb, needed);
+    if (!new_layer) {
+        free(g_album_bg_rgb);
+        g_album_bg_rgb = NULL;
+        g_album_bg_w = 0;
+        g_album_bg_h = 0;
+        return false;
+    }
+
+    g_album_bg_rgb = new_layer;
+    g_album_bg_w = g_width;
+    g_album_bg_h = g_height;
+    g_album_bg_generation = 0;
+    return true;
+}
+
+
+static bool album_background_allowed_now(double now) {
+    if (!g_art_rgba) return false;
+    if (g_art_is_default_fallback || g_art_is_pulse_fallback) return false;
+
+    // The decorative background must obey the same configured stable-track
+    // delay as the foreground artwork lookup. It should not use its own extra
+    // post-load timer, because that makes the background timing drift from the
+    // artwork lookup timing.
+    if (g_art_lookup_track_since < 0.0) return false;
+
+    if (g_cfg_album_art_lookup_delay_seconds > 0.0 &&
+        now - g_art_lookup_track_since < g_cfg_album_art_lookup_delay_seconds) {
+        return false;
+    }
+
+    // If the lookup state has already moved to another track, do not build a
+    // background from stale art. The next real-art success will re-enable it.
+    if (g_art_lookup_track_key[0] && strcmp(g_art_loaded_track_key, g_art_lookup_track_key) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+static void draw_album_art_background_zoomed(void) {
+    if (!g_img || !g_art_rgba || g_art_is_default_fallback) return;
+    if (g_art_w <= 0 || g_art_h <= 0 || g_width <= 0 || g_height <= 0) return;
+    if (!ensure_album_background_layer()) return;
+
+    size_t layer_bytes = (size_t)g_width * (size_t)g_height * 3u;
+
+    // Expensive path is only run when the artwork generation or geometry changes.
+    // Normal frames only memcpy the already-matted layer into g_img.
+    if (g_album_bg_generation != g_art_generation) {
+        const int zoom_percent = 220;
+        const int brightness_percent = 28;
+
+        // 0 = bottom-left, 255 = top-right.
+        // Fade band starts before the screen center and reaches black before
+        // the title/clock region.
+        const int diagonal_fade_start = 96;
+        const int diagonal_fade_end = 144;
+
+        double cover_scale_x = (double)g_width / (double)g_art_w;
+        double cover_scale_y = (double)g_height / (double)g_art_h;
+        double cover_scale = cover_scale_x > cover_scale_y ? cover_scale_x : cover_scale_y;
+        double scale = cover_scale * ((double)zoom_percent / 100.0);
+
+        if (scale <= 0.0) return;
+
+        int crop_w_fp = (int)(((double)g_width / scale) * (double)FIXED_ONE);
+        int crop_h_fp = (int)(((double)g_height / scale) * (double)FIXED_ONE);
+
+        if (crop_w_fp <= 0 || crop_h_fp <= 0) return;
+
+        int src_x_start_fp = (((int)g_art_w * FIXED_ONE) - crop_w_fp) / 2;
+        int src_y_start_fp = (((int)g_art_h * FIXED_ONE) - crop_h_fp) / 2;
+        int x_step = crop_w_fp / g_width;
+        int y_step = crop_h_fp / g_height;
+
+        if (x_step <= 0) x_step = 1;
+        if (y_step <= 0) y_step = 1;
+
+        const uint8_t bg[3] = {
+            (uint8_t)((BG_COLOR >> 16) & 0xFF),
+            (uint8_t)((BG_COLOR >> 8) & 0xFF),
+            (uint8_t)(BG_COLOR & 0xFF)
+        };
+
+        int width_denom = g_width > 1 ? g_width - 1 : 1;
+        int height_denom = g_height > 1 ? g_height - 1 : 1;
+        int src_y_fp = src_y_start_fp;
+
+        for (int y = 0; y < g_height; y++) {
+            int sy = src_y_fp >> 16;
+            sy = clamp_int(sy, 0, g_art_h - 1);
+
+            int inv_y_255 = ((height_denom - y) * 255) / height_denom;
+            int src_x_fp = src_x_start_fp;
+            uint8_t *dst = g_album_bg_rgb + ((size_t)y * (size_t)g_width * 3u);
+
+            for (int x = 0; x < g_width; x++) {
+                int sx = src_x_fp >> 16;
+                sx = clamp_int(sx, 0, g_art_w - 1);
+
+                size_t src_idx = ((size_t)sy * (size_t)g_art_w + (size_t)sx) * 4u;
+                uint8_t a = g_art_rgba[src_idx + 3];
+
+                uint8_t r = composite_channel_over_bg(g_art_rgba[src_idx + 0], a, bg[0]);
+                uint8_t g = composite_channel_over_bg(g_art_rgba[src_idx + 1], a, bg[1]);
+                uint8_t b = composite_channel_over_bg(g_art_rgba[src_idx + 2], a, bg[2]);
+
+                int nx_255 = (x * 255) / width_denom;
+                int diag = (nx_255 + inv_y_255) / 2;
+                int keep = 255;
+
+                if (diag >= diagonal_fade_end) {
+                    keep = 0;
+                } else if (diag > diagonal_fade_start) {
+                    int t = ((diag - diagonal_fade_start) * 255) /
+                            (diagonal_fade_end - diagonal_fade_start);
+                    if (t < 0) t = 0;
+                    if (t > 255) t = 255;
+
+                    int tt = (t * t + 127) / 255;
+                    int smooth = (tt * (765 - (2 * t)) + 127) / 255;
+                    keep = 255 - smooth;
+                }
+
+                unsigned int br = ((unsigned int)r * (unsigned int)brightness_percent) / 100u;
+                unsigned int bgc = ((unsigned int)g * (unsigned int)brightness_percent) / 100u;
+                unsigned int bb = ((unsigned int)b * (unsigned int)brightness_percent) / 100u;
+
+                dst[0] = (uint8_t)((br * (unsigned int)keep) / 255u);
+                dst[1] = (uint8_t)((bgc * (unsigned int)keep) / 255u);
+                dst[2] = (uint8_t)((bb * (unsigned int)keep) / 255u);
+
+                dst += 3;
+                src_x_fp += x_step;
+            }
+
+            src_y_fp += y_step;
+        }
+
+        g_album_bg_generation = g_art_generation;
+    }
+
+    memcpy(g_img, g_album_bg_rgb, layer_bytes);
 }
 
 // ---------------- Framebuffer ----------------
@@ -2520,6 +3270,8 @@ static void flush_native_to_fb(void) {
         if (!g_native || !g_prev_native) return;
     }
 
+    bool wrote_any = false;
+
     build_native_from_rgb_frame();
 
     if (!g_dirty_spans) {
@@ -2594,6 +3346,11 @@ static void flush_native_to_fb(void) {
     for (int y = 0; y < g_height; y++) {
         if (!g_dirty_spans[y].dirty) continue;
         write_native_span_to_fb(y, g_dirty_spans[y].min_x, g_dirty_spans[y].max_x);
+        wrote_any = true;
+    }
+
+    if (wrote_any && g_fb_map_bytes > 0) {
+        (void)msync(g_fb_mem, g_fb_map_bytes, MS_ASYNC);
     }
 
     size_t total_pixels = (size_t)g_width * (size_t)g_height;
@@ -2646,6 +3403,58 @@ static void dim_rgb_frame(uint8_t percent) {
     for (size_t i = 0; i < total_bytes; i++) {
         g_img[i] = (uint8_t)(((unsigned int)g_img[i] * (unsigned int)percent) / 100u);
     }
+}
+
+
+static void draw_alpha_circle_to_image(int cx, int cy, int radius, uint32_t color, uint8_t max_alpha) {
+    if (!g_img || radius <= 0 || max_alpha == 0) return;
+
+    int r2 = radius * radius;
+    int x0 = clamp_int(cx - radius, 0, g_width - 1);
+    int x1 = clamp_int(cx + radius, 0, g_width - 1);
+    int y0 = clamp_int(cy - radius, 0, g_height - 1);
+    int y1 = clamp_int(cy + radius, 0, g_height - 1);
+
+    uint8_t r = (uint8_t)((color >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((color >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(color & 0xFF);
+
+    for (int y = y0; y <= y1; y++) {
+        int dy = y - cy;
+        for (int x = x0; x <= x1; x++) {
+            int dx = x - cx;
+            int d2 = (dx * dx) + (dy * dy);
+            if (d2 > r2) continue;
+
+            uint32_t falloff = (uint32_t)(r2 - d2);
+            uint8_t alpha = (uint8_t)(((uint64_t)max_alpha * falloff * falloff) / ((uint64_t)r2 * (uint64_t)r2));
+            if (alpha == 0) continue;
+
+            size_t idx = ((size_t)y * (size_t)g_width + (size_t)x) * 3;
+            blend_alpha_rgb(&g_img[idx], r, g, b, alpha);
+        }
+    }
+}
+
+static void draw_pulsing_album_art_placeholder(int target_x, int target_y, int target_w, int target_h, double now) {
+    if (target_w <= 0 || target_h <= 0) return;
+
+    int cx = target_x + (target_w / 2);
+    int cy = target_y + (target_h / 2);
+    int base = min_int(target_w, target_h);
+
+    double pulse = (sin(now * 2.2) + 1.0) * 0.5;
+    int glow_r = (base * 30) / 100 + (int)(pulse * (double)((base * 8) / 100));
+    int ring_r = (base * 15) / 100 + (int)(pulse * (double)((base * 4) / 100));
+    int core_r = max_int(3, (base * 5) / 100);
+
+    uint8_t glow_a = (uint8_t)(34 + (pulse * 34.0));
+    uint8_t ring_a = (uint8_t)(105 + (pulse * 95.0));
+    uint8_t core_a = (uint8_t)(145 + (pulse * 70.0));
+
+    draw_alpha_circle_to_image(cx, cy, glow_r, 0x00A3D5, glow_a);
+    draw_alpha_circle_to_image(cx, cy, ring_r, 0x00A3D5, ring_a);
+    draw_alpha_circle_to_image(cx, cy, core_r, 0xFFFFFF, core_a);
 }
 
 static bool draw_volume_overlay_if_needed(double now) {
@@ -2730,12 +3539,10 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool 
     *out_layout_animating = false;
     *out_force_full_redraw = false;
 
-    update_volumio_state();
-    apply_wait_timeout(monotonic_seconds());
-
     time_t now = time(NULL);
     struct tm now_tm;
     localtime_r(&now, &now_tm);
+    double frame_now = monotonic_seconds();
 
     bool show_metadata = state_shows_metadata();
     bool is_playing = (strcmp(g_status_state, "play") == 0);
@@ -2773,6 +3580,10 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool 
     }
 
     draw_fill_rect(0, 0, g_width, g_height, BG_COLOR);
+
+    if (show_metadata && s_anim_progress > 0.01f && album_background_allowed_now(frame_now)) {
+        draw_album_art_background_zoomed();
+    }
 
     char time_str[16];
     if (g_cfg_clock_24h) {
@@ -2834,6 +3645,16 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool 
 
     int cur_clock_x = lerp_int_simple(idle_clock_x, active_clock_x, s_anim_progress);
     int cur_clock_y = lerp_int_simple(idle_clock_y, active_clock_y, s_anim_progress);
+
+    if (show_metadata && s_anim_progress > 0.01f && g_art_rgba && !g_art_is_default_fallback) {
+        int clock_pad_x = scale_x(18);
+        int clock_pad_y = scale_y(14);
+        dim_rect_rgb_percent(cur_clock_x - clock_pad_x,
+                             cur_clock_y - cur_font - clock_pad_y,
+                             clock_w + (clock_pad_x * 2),
+                             cur_font + (clock_pad_y * 2),
+                             58);
+    }
 
     if (big_clock_heartbeat) {
         char *colon = strchr(time_str, ':');
@@ -2912,6 +3733,9 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool 
 
         if (g_art_rgba) {
             draw_album_art_cached(cur_art_x, art_target_y, art_size, art_size);
+        } else if (g_art_is_default_fallback && g_art_is_pulse_fallback) {
+            draw_pulsing_album_art_placeholder(cur_art_x, art_target_y, art_size, art_size, monotonic_seconds());
+            *out_layout_animating = true;
         } else {
             draw_fill_rect(cur_art_x, art_target_y, art_size, art_size, PROGRESS_BAR_BG);
             FT_Set_Pixel_Sizes(g_font_reg, 0, (FT_UInt)small_size);
@@ -3084,7 +3908,7 @@ static bool init_all(void) {
     DBG_LOG("Startup: config=%s fb_path=%s debug=%s log_path=%s max_bytes=%ld",
             CONFIG_PATH, g_cfg_fb_path, g_cfg_debug_enabled ? "true" : "false",
             g_cfg_debug_log_path, g_cfg_debug_log_max_bytes);
-    DBG_LOG("Volumio config: wait_timeout=%.2f", g_cfg_wait_timeout_seconds);
+    DBG_LOG("Volumio config: wait_timeout=%.2f album_art_delay=%.2f album_art_recheck=%.2f", g_cfg_wait_timeout_seconds, g_cfg_album_art_lookup_delay_seconds, g_cfg_album_art_recheck_seconds);
 
     if (FT_Init_FreeType(&g_ft) != 0) {
         fprintf(stderr, "[Font Error] FreeType init failed.\n");
@@ -3118,6 +3942,10 @@ static void cleanup_all(void) {
     }
     
     free_scaled_art();
+    free(g_album_bg_rgb);
+    g_album_bg_rgb = NULL;
+    g_album_bg_w = 0;
+    g_album_bg_h = 0;
     free_scroll_strip();
 
     free(g_http_buffer);
@@ -3167,13 +3995,6 @@ static void cleanup_all(void) {
 static void on_signal(int sig) {
     (void)sig;
     g_running = 0;
-
-    // Wake any blocking HTTP poll/recv/send so systemd restart does not wait on it.
-    int fd = g_http_fd;
-    if (fd >= 0) {
-        g_http_fd = -1;
-        close(fd);
-    }
 }
 
 static void install_signal_handlers(void) {
@@ -3182,7 +4003,7 @@ static void install_signal_handlers(void) {
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
 
-    // Do not use SA_RESTART. We want blocking HTTP syscalls to break immediately on restart.
+    // Do not use SA_RESTART. Poll/recv/send should return on SIGINT/SIGTERM.
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 }
@@ -3207,6 +4028,11 @@ int main(void) {
         bool needs_scroll = false;
         bool layout_animating = false;
         bool force_full_redraw = false;
+
+        // Priority path: poll Volumio and service artwork lookup before any
+        // decorative rendering work. The zoomed background is cosmetic and must
+        // never delay track/art state updates.
+        update_volumio_state();
 
         bool is_playing = draw_clock(&needs_scroll, &layout_animating, &force_full_redraw);
 
