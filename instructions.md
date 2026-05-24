@@ -159,7 +159,9 @@ You should see:
 /dev/fb0
 ```
 
-## 6. Upload the binary
+## 6. Upload the req's + binary
+
+sudo apt install -y libcurl4 ca-certificates
 
 Upload the compiled binary to:
 
