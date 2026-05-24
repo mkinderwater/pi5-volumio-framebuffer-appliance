@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
@@ -47,6 +48,7 @@
 #define VOLUMIO_HOST "127.0.0.1"
 #define VOLUMIO_PORT 3000
 #define VOLUMIO_PATH "/api/v1/getState"
+#define VOLUMIO_FBD_BUILD_ID "delay3-direct-remote-line-cull-2026-05-23k"
 
 // ---------------- Optimization Extensions ----------------
 
@@ -80,7 +82,7 @@
 #define DEFAULT_DEBUG_LOG_PATH "/var/log/volumio_fbd.log"
 #define DEFAULT_DEBUG_LOG_MAX_BYTES (256 * 1024)
 #define DEFAULT_WAIT_TIMEOUT_SECONDS 8.0
-#define DEFAULT_ALBUM_ART_LOOKUP_DELAY_SECONDS 5.0
+#define DEFAULT_ALBUM_ART_LOOKUP_DELAY_SECONDS 3.0
 #define DEFAULT_ALBUM_ART_RECHECK_SECONDS 5.0
 
 // ---------------- Runtime State ----------------
@@ -604,16 +606,21 @@ static bool albumart_source_is_specific(const char *src) {
 }
 
 
-static bool albumart_is_real_track_art(void) {
-    return albumart_source_is_specific(g_status_albumart);
-}
 
 static bool state_has_track_payload(void) {
     return g_status_title[0] != '\0' ||
            g_status_artist[0] != '\0' ||
            g_status_album[0] != '\0' ||
            g_status_duration > 0 ||
-           albumart_is_real_track_art();
+           albumart_source_is_specific(g_status_albumart);
+}
+
+
+static bool current_track_has_identity(void) {
+    return g_status_title[0] != '\0' ||
+           g_status_artist[0] != '\0' ||
+           g_status_album[0] != '\0' ||
+           g_status_duration > 0;
 }
 
 static bool source_state_shows_metadata(void) {
@@ -670,13 +677,6 @@ static void build_current_track_key(char *dst, size_t dst_sz) {
              g_status_duration);
 }
 
-static bool current_track_has_identity(void) {
-    return g_status_title[0] != '\0' ||
-           g_status_artist[0] != '\0' ||
-           g_status_album[0] != '\0' ||
-           g_status_duration > 0;
-}
-
 static void clear_album_art_pixels(void) {
     bool had_art_state = g_art_rgba || g_art_scaled_rgb ||
                          g_art_w > 0 || g_art_h > 0 ||
@@ -693,6 +693,7 @@ static void clear_album_art_pixels(void) {
     g_art_loaded_url[0] = '\0';
     g_art_loaded_track_key[0] = '\0';
     g_art_is_default_fallback = false;
+    g_art_is_pulse_fallback = false;
 
     if (had_art_state) {
         mark_album_art_changed("cleared");
@@ -1594,137 +1595,121 @@ static uint8_t *http_get_localhost_body_keepalive(const char *path, const char *
     return http_get_once(path, accept_header, out_len);
 }
 
-// ---------------- Volumio ----------------
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} CurlMemoryBuffer;
 
-static void url_query_component(char *dst, size_t dst_sz, const char *src) {
-    if (!dst || dst_sz == 0) return;
-    dst[0] = '\0';
+static size_t curl_write_memory_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    CurlMemoryBuffer *buf = (CurlMemoryBuffer *)userdata;
+    size_t add = size * nmemb;
 
-    if (!src || !*src) return;
+    if (!buf || !ptr || add == 0) return 0;
 
-    size_t used = 0;
-
-    for (const unsigned char *p = (const unsigned char *)src; *p && used + 1 < dst_sz; p++) {
-        unsigned char c = *p;
-
-        if ((c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' || c == '_' || c == '.' || c == '~') {
-            dst[used++] = (char)c;
-            dst[used] = '\0';
-            continue;
-        }
-
-        if (used + 3 >= dst_sz) break;
-        snprintf(dst + used, dst_sz - used, "%%%02X", c);
-        used += 3;
+    if (buf->len + add + 1 > HTTP_BUFFER_MAX) {
+        return 0;
     }
 
-    dst[used] = '\0';
+    if (buf->len + add + 1 > buf->cap) {
+        size_t new_cap = buf->cap ? buf->cap : HTTP_BUFFER_INITIAL;
+
+        while (new_cap < buf->len + add + 1) {
+            if (new_cap > HTTP_BUFFER_MAX / 2) {
+                new_cap = HTTP_BUFFER_MAX;
+                break;
+            }
+            new_cap *= 2;
+        }
+
+        if (new_cap < buf->len + add + 1 || new_cap > HTTP_BUFFER_MAX) {
+            return 0;
+        }
+
+        uint8_t *new_data = realloc(buf->data, new_cap);
+        if (!new_data) return 0;
+
+        buf->data = new_data;
+        buf->cap = new_cap;
+    }
+
+    memcpy(buf->data + buf->len, ptr, add);
+    buf->len += add;
+    buf->data[buf->len] = '\0';
+
+    return add;
 }
 
-static bool build_metadata_albumart_path(char *dst, size_t dst_sz) {
+static uint8_t *http_get_remote_body_curl(const char *url, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!url || !*url || !g_running) return NULL;
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        DBG_LOG("Remote artwork curl init failed: url=%s", url);
+        return NULL;
+    }
+
+    CurlMemoryBuffer buf;
+    memset(&buf, 0, sizeof(buf));
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_memory_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "volumio_fbd/" VOLUMIO_FBD_BUILD_ID);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2500L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+
+    CURLcode rc = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK || response_code < 200 || response_code >= 300 || buf.len == 0) {
+        DBG_LOG("Remote artwork curl fetch failed: url=%s rc=%d http=%ld bytes=%zu",
+                url, (int)rc, response_code, buf.len);
+        free(buf.data);
+        return NULL;
+    }
+
+    if (out_len) *out_len = buf.len;
+
+    DBG_LOG("Remote artwork curl fetch ok: url=%s http=%ld bytes=%zu",
+            url, response_code, buf.len);
+
+    return buf.data;
+}
+
+// ---------------- Volumio ----------------
+
+static bool albumart_source_is_remote_url(const char *src) {
+    if (!src) return false;
+    return strncmp(src, "http://", 7) == 0 || strncmp(src, "https://", 8) == 0;
+}
+
+static bool build_local_albumart_path(char *dst, size_t dst_sz, const char *src) {
     if (!dst || dst_sz == 0) return false;
     dst[0] = '\0';
 
-    if (looks_empty_value(g_status_artist) || looks_empty_value(g_status_album)) {
-        return false;
-    }
-
-    char artist[512];
-    char album[512];
-
-    url_query_component(artist, sizeof(artist), g_status_artist);
-    url_query_component(album, sizeof(album), g_status_album);
-
-    if (!artist[0] || !album[0]) return false;
-
-    snprintf(dst, dst_sz, "/albumart?web=%s/%s/extralarge&metadata=false", artist, album);
-    return true;
-}
-
-static int build_album_art_candidates(char paths[][2048], int max_count, const char *src) {
-    if (!paths || max_count <= 0) return 0;
-
-    int count = 0;
-    char path[2048];
-
-    for (int i = 0; i < max_count; i++) paths[i][0] = '\0';
-    if (!albumart_source_is_specific(src)) return 0;
+    if (!src || !*src) return false;
 
     if (strncmp(src, "http://127.0.0.1:3000", 21) == 0 ||
         strncmp(src, "http://localhost:3000", 21) == 0) {
-        snprintf(paths[count++], 2048, "%s", src + 21);
-        return count;
+        snprintf(dst, dst_sz, "%s", src + 21);
+        return dst[0] != '\0';
     }
 
-    if (strncmp(src, "http://", 7) == 0 || strncmp(src, "https://", 8) == 0) {
-        if (build_metadata_albumart_path(path, sizeof(path)) && count < max_count) {
-            snprintf(paths[count++], 2048, "%s", path);
-        }
-
-        if (count < max_count) {
-            snprintf(paths[count++], 2048, "/albumart?web=%s", src);
-        }
-
-        char web_url[1536];
-        url_query_component(web_url, sizeof(web_url), src);
-        if (web_url[0] && count < max_count) {
-            snprintf(paths[count++], 2048, "/albumart?web=%s", web_url);
-        }
-
-        return count;
+    if (albumart_source_is_remote_url(src)) {
+        return false;
     }
 
-    snprintf(paths[count++], 2048, "%s%s", src[0] == '/' ? "" : "/", src);
-    return count;
-}
-
-
-static void rgba_put_pixel(uint8_t *rgba, int w, int h, int x, int y, uint32_t color) {
-    if (!rgba || x < 0 || y < 0 || x >= w || y >= h) return;
-
-    size_t idx = ((size_t)y * (size_t)w + (size_t)x) * 4;
-    rgba[idx + 0] = (uint8_t)((color >> 16) & 0xFF);
-    rgba[idx + 1] = (uint8_t)((color >> 8) & 0xFF);
-    rgba[idx + 2] = (uint8_t)(color & 0xFF);
-    rgba[idx + 3] = 255;
-}
-
-static void rgba_fill_rect(uint8_t *rgba, int w, int h, int x, int y, int rw, int rh, uint32_t color) {
-    if (!rgba || rw <= 0 || rh <= 0) return;
-
-    int x0 = clamp_int(x, 0, w);
-    int y0 = clamp_int(y, 0, h);
-    int x1 = clamp_int(x + rw, 0, w);
-    int y1 = clamp_int(y + rh, 0, h);
-
-    for (int yy = y0; yy < y1; yy++) {
-        for (int xx = x0; xx < x1; xx++) {
-            rgba_put_pixel(rgba, w, h, xx, yy, color);
-        }
-    }
-}
-
-static void rgba_fill_circle(uint8_t *rgba, int w, int h, int cx, int cy, int radius, uint32_t color) {
-    if (!rgba || radius <= 0) return;
-
-    int r2 = radius * radius;
-    int x0 = clamp_int(cx - radius, 0, w - 1);
-    int x1 = clamp_int(cx + radius, 0, w - 1);
-    int y0 = clamp_int(cy - radius, 0, h - 1);
-    int y1 = clamp_int(cy + radius, 0, h - 1);
-
-    for (int y = y0; y <= y1; y++) {
-        int dy = y - cy;
-        for (int x = x0; x <= x1; x++) {
-            int dx = x - cx;
-            if ((dx * dx) + (dy * dy) <= r2) {
-                rgba_put_pixel(rgba, w, h, x, y, color);
-            }
-        }
-    }
+    snprintf(dst, dst_sz, "%s%s", src[0] == '/' ? "" : "/", src);
+    return dst[0] != '\0';
 }
 
 static void activate_pulse_album_art_fallback(const char *track_key, const char *reason) {
@@ -1855,8 +1840,8 @@ static void update_album_art_if_needed(void) {
         load_default_album_art_fallback(track_key, "waiting for stable artwork lookup", false);
     }
 
-    // Fast skipping protection: do not touch Volumio artwork endpoints until the
-    // same track identity has remained stable for the configured delay.
+    // Fast skipping protection: do not touch artwork endpoints until the same
+    // track identity has remained stable for the configured delay.
     if (!album_art_track_stable_for_lookup(track_key, now)) {
         return;
     }
@@ -1880,7 +1865,6 @@ static void update_album_art_if_needed(void) {
         return;
     }
 
-
     if (g_art_last_check_at >= 0.0 &&
         now - g_art_last_check_at < g_cfg_album_art_recheck_seconds) {
         return;
@@ -1888,67 +1872,68 @@ static void update_album_art_if_needed(void) {
 
     g_art_last_check_at = now;
 
-    char art_paths[3][2048];
-    int art_path_count = build_album_art_candidates(art_paths, 3, g_status_albumart);
+    size_t img_len = 0;
+    uint8_t *img_data = NULL;
+    char art_path[2048];
+    const char *decode_label = g_status_albumart;
+    bool used_remote_direct = false;
 
-    if (art_path_count <= 0) {
-        DBG_LOG("Album art path unsupported: raw='%s' track='%s'", g_status_albumart, track_key);
-        load_default_album_art_fallback(track_key, "no artwork candidates", true);
-        return;
-    }
-
-    for (int i = 0; i < art_path_count; i++) {
-        const char *art_path = art_paths[i];
-        if (!art_path || !*art_path) continue;
-
-        DBG_LOG("Album art candidate fetch: candidate=%d/%d path=%s track='%s'",
-                i + 1, art_path_count, art_path, track_key);
-
+    if (albumart_source_is_remote_url(g_status_albumart) &&
+        strncmp(g_status_albumart, "http://127.0.0.1:3000", 21) != 0 &&
+        strncmp(g_status_albumart, "http://localhost:3000", 21) != 0) {
+        used_remote_direct = true;
+        DBG_LOG("Album art fetch direct remote: url=%s track='%s'",
+                g_status_albumart, track_key);
+        img_data = http_get_remote_body_curl(g_status_albumart, &img_len);
+    } else if (build_local_albumart_path(art_path, sizeof(art_path), g_status_albumart)) {
+        decode_label = art_path;
+        DBG_LOG("Album art fetch local: path=%s track='%s'",
+                art_path, track_key);
         close_http_keepalive();
+        img_data = http_get_localhost_body_keepalive(art_path, "image/*", &img_len);
+    } else {
+        DBG_LOG("Album art path unsupported: raw='%s' track='%s'", g_status_albumart, track_key);
+    }
 
-        size_t img_len = 0;
-        uint8_t *img_data = http_get_localhost_body_keepalive(art_path, "image/*", &img_len);
-
-        if (!img_data || img_len == 0) {
-            DBG_LOG("Album art download failed: candidate=%d path=%s", i + 1, art_path);
-            free(img_data);
-            continue;
-        }
-
-        int art_w = 0;
-        int art_h = 0;
-        int comp = 0;
-        uint8_t *new_art = stbi_load_from_memory(img_data, (int)img_len, &art_w, &art_h, &comp, 4);
+    if (!img_data || img_len == 0) {
+        DBG_LOG("Album art download failed: source=%s track='%s' remote=%s",
+                decode_label ? decode_label : "(null)", track_key, used_remote_direct ? "true" : "false");
         free(img_data);
-
-        if (!new_art || art_w <= 0 || art_h <= 0) {
-            if (new_art) stbi_image_free(new_art);
-            DBG_LOG("Album art decode failed: candidate=%d path=%s bytes=%zu", i + 1, art_path, img_len);
-            continue;
-        }
-
-        clear_album_art_pixels();
-
-        g_art_rgba = new_art;
-        g_art_w = art_w;
-        g_art_h = art_h;
-        snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "%s", art_cache_key);
-        snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
-        g_art_is_default_fallback = false;
-        g_art_is_pulse_fallback = false;
-        mark_album_art_changed("real art loaded");
-        g_art_last_check_at = -1.0;
-
-        DBG_LOG("Album art loaded: candidate=%d path=%s bytes=%zu size=%dx%d track='%s' generation=%lu",
-                i + 1, art_path, img_len, g_art_w, g_art_h, track_key, g_art_generation);
+        g_art_loaded_url[0] = '\0';
+        load_default_album_art_fallback(track_key, "specific artwork unavailable", true);
         return;
     }
 
-    // Keep fallback visible and retry real candidates later. Volumio default is
-    // delayed until after candidate failure so /albumart is not touched during
-    // source startup.
-    g_art_loaded_url[0] = '\0';
-    load_default_album_art_fallback(track_key, "specific artwork unavailable", true);
+    int art_w = 0;
+    int art_h = 0;
+    int comp = 0;
+    uint8_t *new_art = stbi_load_from_memory(img_data, (int)img_len, &art_w, &art_h, &comp, 4);
+    free(img_data);
+
+    if (!new_art || art_w <= 0 || art_h <= 0) {
+        if (new_art) stbi_image_free(new_art);
+        DBG_LOG("Album art decode failed: source=%s bytes=%zu track='%s'",
+                decode_label ? decode_label : "(null)", img_len, track_key);
+        g_art_loaded_url[0] = '\0';
+        load_default_album_art_fallback(track_key, "specific artwork decode failed", true);
+        return;
+    }
+
+    clear_album_art_pixels();
+
+    g_art_rgba = new_art;
+    g_art_w = art_w;
+    g_art_h = art_h;
+    snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "%s", art_cache_key);
+    snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
+    g_art_is_default_fallback = false;
+    g_art_is_pulse_fallback = false;
+    mark_album_art_changed("real art loaded");
+    g_art_last_check_at = -1.0;
+
+    DBG_LOG("Album art loaded: source=%s bytes=%zu size=%dx%d track='%s' generation=%lu remote=%s",
+            decode_label ? decode_label : "(null)", img_len, g_art_w, g_art_h,
+            track_key, g_art_generation, used_remote_direct ? "true" : "false");
 }
 
 
@@ -3534,6 +3519,73 @@ static bool draw_volume_overlay_if_needed(double now) {
     return true;
 }
 
+static void draw_waveform_column_alpha(int x, int y0, int y1, uint32_t color, uint8_t alpha) {
+    if (!g_img || alpha == 0 || x < 0 || x >= g_width) return;
+
+    if (y0 > y1) {
+        int tmp = y0;
+        y0 = y1;
+        y1 = tmp;
+    }
+
+    y0 = clamp_int(y0, 0, g_height - 1);
+    y1 = clamp_int(y1, 0, g_height - 1);
+    if (y1 < y0) return;
+
+    uint8_t r = (uint8_t)((color >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((color >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(color & 0xFF);
+
+    for (int y = y0; y <= y1; y++) {
+        size_t idx = ((size_t)y * (size_t)g_width + (size_t)x) * 3;
+        blend_alpha_rgb(&g_img[idx], r, g, b, alpha);
+    }
+}
+
+static void draw_synthetic_waveform(int target_x, int target_y, int w, int h, double now) {
+    if (strcmp(g_status_state, "play") != 0) return;
+    if (!g_img || w <= 0 || h <= 0) return;
+
+    int x0 = clamp_int(target_x, 0, g_width);
+    int x1 = clamp_int(target_x + w, 0, g_width);
+    int y0 = clamp_int(target_y, 0, g_height);
+    int y1 = clamp_int(target_y + h, 0, g_height);
+
+    if (x1 <= x0 || y1 <= y0) return;
+
+    int draw_w = x1 - x0;
+    int draw_h = y1 - y0;
+    int half_h = draw_h / 2;
+    if (half_h < 2) return;
+
+    int center_y = y0 + half_h;
+
+    // Synthetic only: no ALSA, no threads, no extra dependencies.
+    // Seek anchors the shape to playback position; monotonic time keeps it fluid
+    // between Volumio state polls.
+    float phase = ((float)g_status_seek * 0.035f) + ((float)now * 2.8f);
+
+    for (int x = 0; x < draw_w; x++) {
+        float xf = (float)x;
+
+        float val =
+            sinf((xf * 0.055f) + phase) * 0.45f +
+            cosf((xf * 0.026f) - (phase * 0.72f)) * 0.35f +
+            sinf((xf * 0.013f) + (phase * 1.37f)) * 0.20f;
+
+        if (val < 0.0f) val = -val;
+
+        // Keep it decorative. The progress bar remains the useful signal.
+        int bar_h = (int)(val * (float)half_h * 0.72f);
+        if (bar_h < 1) bar_h = 1;
+        if (bar_h > half_h) bar_h = half_h;
+
+        // Gentle centre emphasis so it reads as a waveform without overpowering text.
+        uint8_t alpha = (uint8_t)(34 + (bar_h * 42) / half_h);
+        draw_waveform_column_alpha(x0 + x, center_y - bar_h, center_y + bar_h, 0xFFFFFF, alpha);
+    }
+}
+
 static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool *out_force_full_redraw) {
     *out_needs_scroll = false;
     *out_layout_animating = false;
@@ -3579,10 +3631,10 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool 
         s_last_idle_minute_key = -1;
     }
 
-    draw_fill_rect(0, 0, g_width, g_height, BG_COLOR);
-
     if (show_metadata && s_anim_progress > 0.01f && album_background_allowed_now(frame_now)) {
         draw_album_art_background_zoomed();
+    } else {
+        draw_fill_rect(0, 0, g_width, g_height, BG_COLOR);
     }
 
     char time_str[16];
@@ -3834,6 +3886,14 @@ static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool 
         if (pb_y < album_y + scale_y(16)) pb_y = album_y + scale_y(16);
         if (pb_y + pb_h + scale_y(18) > g_height) pb_y = g_height - scale_y(28);
 
+        if (is_playing) {
+            int wave_h = scale_y(36);
+            if (wave_h < 14) wave_h = 14;
+            int wave_y = pb_y - ((wave_h - pb_h) / 2);
+            draw_synthetic_waveform(pb_x, wave_y, pb_w, wave_h, frame_now);
+            *out_layout_animating = true;
+        }
+
         draw_fill_rect(pb_x, pb_y, pb_w, pb_h, PROGRESS_BAR_BG);
 
         if (g_status_duration > 0) {
@@ -3905,8 +3965,14 @@ static bool allocate_surfaces(void) {
 static bool init_all(void) {
     load_json_config();
     debug_log_open();
-    DBG_LOG("Startup: config=%s fb_path=%s debug=%s log_path=%s max_bytes=%ld",
-            CONFIG_PATH, g_cfg_fb_path, g_cfg_debug_enabled ? "true" : "false",
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        fprintf(stderr, "[Curl Error] curl_global_init failed.\n");
+        DBG_LOG("curl_global_init failed");
+        return false;
+    }
+    DBG_LOG("Startup: build=%s config=%s fb_path=%s debug=%s log_path=%s max_bytes=%ld",
+            VOLUMIO_FBD_BUILD_ID, CONFIG_PATH, g_cfg_fb_path, g_cfg_debug_enabled ? "true" : "false",
             g_cfg_debug_log_path, g_cfg_debug_log_max_bytes);
     DBG_LOG("Volumio config: wait_timeout=%.2f album_art_delay=%.2f album_art_recheck=%.2f", g_cfg_wait_timeout_seconds, g_cfg_album_art_lookup_delay_seconds, g_cfg_album_art_recheck_seconds);
 
@@ -3988,6 +4054,7 @@ static void cleanup_all(void) {
 
     hide_console_cursor(false);
     close_framebuffer();
+    curl_global_cleanup();
     DBG_LOG("Shutdown complete");
     debug_log_close();
 }
