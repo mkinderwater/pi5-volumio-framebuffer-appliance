@@ -5,25 +5,15 @@
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ifaddrs.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include <glob.h>
+#include <ifaddrs.h>
 #include <json-c/json.h>
-
-#ifndef JSON_C_TO_STRING_NOSLASHESCAPE
-#define JSON_C_TO_STRING_NOSLASHESCAPE 16
-#endif
-#include <limits.h>
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_HDR
-#define STBI_NO_LINEAR
-#include "stb_image.h"
 #include <linux/fb.h>
 #include <math.h>
-#include <netinet/in.h>
 #include <net/if.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,863 +22,1216 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
-// ---------------- Configuration ----------------
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#include "stb_image.h"
+
+#ifndef JSON_C_TO_STRING_NOSLASHESCAPE
+#define JSON_C_TO_STRING_NOSLASHESCAPE 16
+#endif
 
 #define DESIGN_WIDTH 480
 #define DESIGN_HEIGHT 320
-
-#define VOLUMIO_HOST "127.0.0.1"
-#define VOLUMIO_PORT 3000
-#define VOLUMIO_PATH "/api/v1/getState"
-#define VOLUMIO_FBD_BUILD_ID "delay3-direct-remote-line-cull-2026-05-23k"
-
-// ---------------- Optimization Extensions ----------------
-
-#define HARDWARE_FPS_SCROLLING 30.0   // 33.3ms windows for marquee text and fade animation
-#define HARDWARE_FPS_STATIC     1.0   // 1000ms low-power check window
-#define HARDWARE_FPS_SLEEP      0.2   // 5000ms deep-idle check window when nothing animates
-#define HARDWARE_FPS_PLAYING    1.0   // 1000ms metadata/progress refresh when playback is static
-
-
-#define COLON_FADE_TABLE_SIZE 64
-#define COLON_FADE_HZ 0.65
-
-#define BG_COLOR 0x000000
-#define TEXT_COLOR_MAIN 0xFFFFFF
-#define TEXT_COLOR_DIM 0x888888
-#define PROGRESS_BAR_BG 0x333333
-#define PROGRESS_BAR_FG 0x00FF00
-#define VOLUME_OVERLAY_DIM_PERCENT 35
-#define VOLUME_BAR_BG 0x101010
-
+#define CONFIG_PATH "/etc/volumio_fbd_config.json"
+#define VOLUMIO_STATE_URL "http://127.0.0.1:3000/api/v1/getState"
 #define FONT_BOLD "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 #define FONT_REG  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+#define HTTP_MAX_BYTES (4u * 1024u * 1024u)
+#define CURL_CONNECT_TIMEOUT_MS 500L
+#define CURL_TOTAL_TIMEOUT_MS 1500L
+#define BG_BLACK 0x000000
+#define WHITE 0xFFFFFF
+#define DIM 0xAAAAAA
+#define MUTED 0x777777
+#define BAR_BG 0x202020
+#define BAR_FG 0x00FF00
 
-#define CONFIG_PATH "/etc/volumio_fbd_config.json"
+typedef struct {
+    int padding;
+    int footer_height;
+    int header_height;
+    int progress_bar_height;
+    int volume_bar_width;
+    int volume_bar_height;
+    int volume_bar_right_margin;
+    int volume_overlay_seconds;
+    int album_art_size;
+    int generic_album_art_size;
+    int title_font_size;
+    int artist_font_size;
+    int album_font_size;
+    int source_font_size;
+    int footer_font_size;
+    int small_clock_font_size;
+    int idle_clock_font_size;
+    int idle_date_font_size;
+    int idle_ip_font_size;
+    int airplay_icon_width;
+    int airplay_icon_height;
+    uint32_t color_background;
+    uint32_t color_text_main;
+    uint32_t color_text_dim;
+    uint32_t color_text_muted;
+    uint32_t color_panel;
+    uint32_t color_panel_line;
+    uint32_t color_progress_bg;
+    uint32_t color_progress_fg;
+    uint32_t color_volume_bar;
+    uint32_t color_album_placeholder;
+} UiConfig;
 
-#define HTTP_BUFFER_INITIAL (64u * 1024u)
-#define HTTP_BUFFER_MAX     (4u * 1024u * 1024u)
+typedef struct {
+    char fb_path[256];
+    int display_width;
+    int display_height;
+    bool clock_24h;
+    double return_to_clock_seconds;
+    bool colon_alpha_enabled;
+    double colon_alpha_hz;
+    int colon_alpha_min;
+    int colon_alpha_max;
+    bool album_bg_enabled;
+    int album_bg_zoom_percent;
+    int album_bg_brightness_percent;
+    bool album_bg_fade_when_title_scrolls;
+    int album_bg_fade_start;
+    int album_bg_fade_end;
+    UiConfig ui;
+} Config;
 
-#define FIXED_ONE 65536
+typedef struct {
+    char state[16];
+    char service[64];
+    char track_type[64];
+    char title[256];
+    char artist[256];
+    char album[256];
+    char albumart[1024];
+    char art_url[1536];
+    char samplerate[64];
+    char bitdepth[64];
+    double seek;
+    double duration;
+    int volume;
+} PlayerState;
 
-#define DEFAULT_DEBUG_LOG_PATH "/var/log/volumio_fbd.log"
-#define DEFAULT_DEBUG_LOG_MAX_BYTES (256 * 1024)
-#define DEFAULT_WAIT_TIMEOUT_SECONDS 8.0
-#define DEFAULT_ALBUM_ART_LOOKUP_DELAY_SECONDS 3.0
-#define DEFAULT_ALBUM_ART_RECHECK_SECONDS 5.0
+typedef struct {
+    bool running;
+    char rate[32];
+    char bits[32];
+    char channels[32];
+    char line[128];
+} AudioInfo;
 
-// ---------------- Runtime State ----------------
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} MemBuf;
 
 static volatile sig_atomic_t g_running = 1;
-
-// JSON config
-static char g_cfg_fb_path[256] = "/dev/fb0";
-static int g_cfg_width = DESIGN_WIDTH;
-static int g_cfg_height = DESIGN_HEIGHT;
-static bool g_cfg_clock_24h = false; // false = 12h, true = 24h
-static char g_cfg_cpu_temp_unit = 'C';
-static double g_cfg_wait_timeout_seconds = DEFAULT_WAIT_TIMEOUT_SECONDS;
-static double g_cfg_album_art_lookup_delay_seconds = DEFAULT_ALBUM_ART_LOOKUP_DELAY_SECONDS;
-static double g_cfg_album_art_recheck_seconds = DEFAULT_ALBUM_ART_RECHECK_SECONDS;
-static bool g_cfg_debug_enabled = false;
-static char g_cfg_debug_log_path[256] = DEFAULT_DEBUG_LOG_PATH;
-static long g_cfg_debug_log_max_bytes = DEFAULT_DEBUG_LOG_MAX_BYTES;
-static FILE *g_debug_log_fp = NULL;
-static long g_debug_log_bytes_written = 0;
-
-// Dynamic framebuffer geometry
-static int g_width = DESIGN_WIDTH;
-static int g_height = DESIGN_HEIGHT;
-static int g_bpp = 16;
-static int g_bytes_per_pixel = 2;
-static int g_line_length = DESIGN_WIDTH * 2;
-static size_t g_fb_map_bytes = 0;
+static Config g_cfg;
+static int g_fb_fd = -1;
+static uint8_t *g_fb = NULL;
+static size_t g_fb_bytes = 0;
 static struct fb_var_screeninfo g_vinfo;
 static struct fb_fix_screeninfo g_finfo;
-
-// Fast lookup tables for pixel format conversion
-static uint32_t g_r_lut[256];
-static uint32_t g_g_lut[256];
-static uint32_t g_b_lut[256];
-
-// Display descriptors
-static int g_fb_fd = -1;
-static uint8_t *g_fb_mem = NULL;
-
-// Dynamic surfaces
-static uint8_t *g_img = NULL;          // RGB888, g_width * g_height * 3
-static uint32_t *g_native = NULL;      // native framebuffer pixel value per pixel, one 32-bit slot per pixel
-static uint32_t *g_prev_native = NULL; // previous native pixel value per pixel, one 32-bit slot per pixel
-static uint16_t *g_native16 = NULL;    // packed native 16-bit pixels for true memcpy blits on RGB565-style framebuffers
-static uint16_t *g_prev_native16 = NULL; // previous packed native 16-bit pixels
-static bool g_prev_frame_valid = false;
+static int g_w = DESIGN_WIDTH;
+static int g_h = DESIGN_HEIGHT;
+static int g_bpp = 16;
+static int g_stride = DESIGN_WIDTH * 2;
+static uint8_t *g_img = NULL;       /* RGB888 */
+static uint8_t *g_prev_img = NULL;  /* previous RGB888 frame for dirty-span flush */
+static bool g_prev_valid = false;
 
 typedef struct {
+    bool dirty;
     int min_x;
     int max_x;
-    bool dirty;
-} RowSpanTracker;
+} DirtySpan;
+static DirtySpan *g_dirty_spans = NULL;
 
-// Runtime-sized dirty row span map. One entry per visible framebuffer row.
-static RowSpanTracker *g_dirty_spans = NULL;
-
-// FreeType
-static FT_Library g_ft = NULL;
-static FT_Face g_font_bold = NULL;
-static FT_Face g_font_reg = NULL;
-
-#define GLYPH_ATLAS_MAX 64
-#define GLYPH_CACHE_SLOTS 512
-
+#define GLYPH_CACHE_SLOTS 1024
 typedef struct {
     bool valid;
-    uint32_t codepoint;
+    FT_Face face;
+    int px;
+    unsigned int codepoint;
     int width;
     int height;
-    int pitch;
     int advance;
     int left;
     int top;
     uint8_t *alpha;
 } GlyphCacheEntry;
+static GlyphCacheEntry g_glyph_cache[GLYPH_CACHE_SLOTS];
 
-typedef struct {
-    bool used;
-    FT_Face face;
-    int pixel_size;
-    GlyphCacheEntry glyphs[GLYPH_CACHE_SLOTS];
-} GlyphAtlas;
+static uint8_t *g_art_scaled_rgb = NULL;
+static int g_art_scaled_w = 0;
+static int g_art_scaled_h = 0;
+static unsigned long g_art_scaled_generation = 0;
 
-static GlyphAtlas g_glyph_atlases[GLYPH_ATLAS_MAX];
-static size_t g_glyph_atlas_count = 0;
-
-// Scroll-strip cache. Long scrolling titles are rendered once, then copied by offset.
-static uint8_t *g_scroll_strip_rgb = NULL;
+static uint8_t *g_scroll_strip_alpha = NULL;
 static int g_scroll_strip_w = 0;
 static int g_scroll_strip_h = 0;
 static int g_scroll_strip_cycle_w = 0;
-static int g_scroll_strip_font_size = 0;
+static int g_scroll_strip_px = 0;
 static int g_scroll_strip_clip_w = 0;
-static int g_scroll_strip_clip_h = 0;
-static int g_scroll_strip_baseline = 0;
-static int g_scroll_strip_gap = 0;
 static uint32_t g_scroll_strip_color = 0;
 static FT_Face g_scroll_strip_face = NULL;
 static char g_scroll_strip_text[256] = "";
-static double g_scroll_strip_started_at = 0.0;
 
-static bool g_last_big_clock_heartbeat = false;
-static bool g_colon_fade_active = false;
-static uint8_t g_colon_alpha = 255;
-
-static const uint8_t g_sine_alpha_lut[COLON_FADE_TABLE_SIZE] = {
-    0, 1, 2, 5, 10, 15, 21, 29,
-    37, 47, 57, 67, 79, 90, 103, 115,
-    128, 140, 152, 165, 176, 188, 198, 208,
-    218, 226, 234, 240, 245, 250, 253, 254,
-    255, 254, 253, 250, 245, 240, 234, 226,
-    218, 208, 198, 188, 176, 165, 152, 140,
-    128, 115, 103, 90, 79, 67, 57, 47,
-    37, 29, 21, 15, 10, 5, 2, 1
-};
-
-static void free_scroll_strip(void);
-
-// Keep-alive HTTP
-static int g_http_fd = -1;
-static uint8_t *g_http_buffer = NULL;
-static size_t g_http_buf_cap = 0;
-static size_t g_http_buf_len = 0;
-
-// Volumio state
-static char g_status_state[32] = "stop";
-static char g_status_title[256] = "";
-static char g_status_artist[256] = "";
-static char g_status_album[256] = "";
-static char g_status_albumart[512] = "";
-static char g_status_track_type[64] = "";
-static char g_status_samplerate[64] = "";
-static char g_status_bitdepth[64] = "";
-static int g_status_seek = 0;       // seconds, as reported by Volumio
-static int g_status_duration = 0;   // seconds
-static int g_status_volume = -1;    // 0-100, as reported by Volumio
-static bool g_status_volume_seen = false;
-static int g_volume_overlay_start_volume = -1;
-static int g_volume_overlay_direction = 0; // 1 = up, -1 = down
-static double g_volume_overlay_last_change_at = -1.0;
-static double g_status_last_updated = 0.0;
-static double g_no_metadata_started_at = -1.0;
-static double g_status_fetch_failed_started_at = -1.0;
-static bool g_wait_timeout_latched = false;
-static double g_last_latch_log_at = -1.0;
-static double g_pause_timeout_started_at = -1.0;
-static bool g_pause_timeout_latched = false;
-static char g_pause_timeout_track_key[1024] = "";
-static double g_pause_timeout_last_log_at = -1.0;
-
-// Album art
+static FT_Library g_ft;
+static FT_Face g_font_bold;
+static FT_Face g_font_reg;
+static CURL *g_curl = NULL;
 static uint8_t *g_art_rgba = NULL;
 static int g_art_w = 0;
 static int g_art_h = 0;
-static char g_art_loaded_url[1536] = "";
-static char g_art_loaded_track_key[1024] = "";
-static bool g_art_is_default_fallback = false;
-static bool g_art_is_pulse_fallback = false;
-static double g_art_last_check_at = -1.0;
-static char g_art_lookup_track_key[1024] = "";
-static double g_art_lookup_track_since = -1.0;
-
-// Scaled Album Art Cache (Optimization)
-static uint8_t *g_art_scaled_rgb = NULL;
-static int g_cached_art_w = 0;
-static int g_cached_art_h = 0;
-
-// Album-art update verification. The scaled cache is tied to this generation
-// so a changed g_art_rgba can never reuse the previous scaled bitmap.
+static char g_art_url[1536] = "";
 static unsigned long g_art_generation = 1;
-static unsigned long g_art_scaled_generation = 0;
+static uint8_t *g_bg_rgb = NULL;
+static int g_bg_w = 0;
+static int g_bg_h = 0;
+static unsigned long g_bg_generation = 0;
+static bool g_bg_fade = false;
+static int g_bg_brightness = -1;
+static int g_bg_zoom = -1;
+static double g_audio_stopped_at = -1.0;
+static double g_last_volumio_fetch = -99.0;
+static double g_last_alsa_fetch = -99.0;
+static PlayerState g_state;
+static AudioInfo g_audio;
+static int g_last_observed_volume = -1000;
+static int g_volume_overlay_volume = -1;
+static int g_volume_overlay_direction = 0; /* 1 = up, -1 = down */
+static double g_volume_overlay_started_at = -1.0;
+#define VOLUME_OVERLAY_SECONDS 2.0
 
-// Offscreen zoomed background layer. The album background is rendered here,
-// matted into black, then copied to g_img as one finished layer. This prevents
-// any later path from showing the unmatted background.
-static uint8_t *g_album_bg_rgb = NULL;
-static int g_album_bg_w = 0;
-static int g_album_bg_h = 0;
-static unsigned long g_album_bg_generation = 0;
-
-
-// ---------------- Fast Math ----------------
-
-// Exact fast division by 255 for values up to 65025 (255*255)
-static inline uint8_t fast_div_255(uint16_t val) {
-    return (uint8_t)((val + 1 + (val >> 8)) >> 8);
-}
-
-// ---------------- Timing ----------------
-
-static double monotonic_seconds(void) {
+static double now_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 static void sleep_seconds(double s) {
     if (s <= 0.0) return;
-
     struct timespec req;
     req.tv_sec = (time_t)s;
-    req.tv_nsec = (long)((s - (double)req.tv_sec) * 1e9);
-
-    while (nanosleep(&req, &req) == -1 && errno == EINTR && g_running) {}
+    req.tv_nsec = (long)((s - (double)req.tv_sec) * 1000000000.0);
+    while (g_running && nanosleep(&req, &req) == -1 && errno == EINTR) {}
 }
 
-static void update_colon_fade_alpha(double now) {
-    if (!g_colon_fade_active) {
-        g_colon_alpha = 255;
-        return;
-    }
-
-    double phase = fmod(now * COLON_FADE_HZ, 1.0);
-    if (phase < 0.0) phase += 1.0;
-
-    size_t idx = (size_t)(phase * (double)COLON_FADE_TABLE_SIZE);
-    if (idx >= COLON_FADE_TABLE_SIZE) idx = COLON_FADE_TABLE_SIZE - 1;
-
-    g_colon_alpha = g_sine_alpha_lut[idx];
+static void on_signal(int sig) {
+    (void)sig;
+    g_running = 0;
 }
 
-// ---------------- Debug Logging ----------------
-
-static void debug_log_close(void) {
-    if (g_debug_log_fp) {
-        fflush(g_debug_log_fp);
-        fclose(g_debug_log_fp);
-        g_debug_log_fp = NULL;
-    }
-
-    g_debug_log_bytes_written = 0;
-}
-
-static void debug_log_rotate_if_needed(void) {
-    if (!g_cfg_debug_enabled || !g_cfg_debug_log_path[0]) return;
-
-    if (g_cfg_debug_log_max_bytes < 4096) {
-        g_cfg_debug_log_max_bytes = 4096;
-    }
-
-    struct stat st;
-    if (stat(g_cfg_debug_log_path, &st) != 0) return;
-
-    if (st.st_size < g_cfg_debug_log_max_bytes) return;
-
-    char rotated[512];
-    snprintf(rotated, sizeof(rotated), "%s.1", g_cfg_debug_log_path);
-
-    unlink(rotated);
-    rename(g_cfg_debug_log_path, rotated);
-}
-
-static void debug_log_open(void) {
-    if (!g_cfg_debug_enabled) return;
-
-    debug_log_rotate_if_needed();
-
-    g_debug_log_fp = fopen(g_cfg_debug_log_path, "a");
-    if (!g_debug_log_fp) {
-        fprintf(stderr, "[Debug Warning] Could not open log file: %s\n", g_cfg_debug_log_path);
-        g_cfg_debug_enabled = false;
-        return;
-    }
-
-    struct stat st;
-    if (stat(g_cfg_debug_log_path, &st) == 0 && st.st_size > 0) {
-        g_debug_log_bytes_written = (long)st.st_size;
-    } else {
-        g_debug_log_bytes_written = 0;
-    }
-
-    setvbuf(g_debug_log_fp, NULL, _IOLBF, 0);
-}
-
-static void debug_log_reopen_if_limit_reached(void) {
-    if (!g_cfg_debug_enabled || !g_debug_log_fp) return;
-
-    if (g_cfg_debug_log_max_bytes < 4096) {
-        g_cfg_debug_log_max_bytes = 4096;
-    }
-
-    if (g_debug_log_bytes_written < g_cfg_debug_log_max_bytes) return;
-
-    debug_log_close();
-    debug_log_rotate_if_needed();
-    debug_log_open();
-}
-
-static void debug_logf(const char *fmt, ...) {
-    if (!g_cfg_debug_enabled || !g_debug_log_fp) return;
-
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-
-    char stamp[64];
-    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_now);
-
-    int wrote = fprintf(g_debug_log_fp, "[%s] ", stamp);
-    if (wrote > 0) g_debug_log_bytes_written += wrote;
-
-    va_list ap;
-    va_start(ap, fmt);
-    wrote = vfprintf(g_debug_log_fp, fmt, ap);
-    va_end(ap);
-    if (wrote > 0) g_debug_log_bytes_written += wrote;
-
-    if (fputc('\n', g_debug_log_fp) != EOF) {
-        g_debug_log_bytes_written++;
-    }
-
-    debug_log_reopen_if_limit_reached();
-}
-
-#define DBG_LOG(...) debug_logf(__VA_ARGS__)
-
-// ---------------- Utility ----------------
-
-static inline int clamp_int(int v, int min_v, int max_v) {
-    if (v < min_v) return min_v;
-    if (v > max_v) return max_v;
+static int clampi(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
     return v;
 }
 
-static inline int min_int(int a, int b) {
-    return a < b ? a : b;
+static int max_i(int a, int b) { return a > b ? a : b; }
+static int sx(int v) { return (int)(((long long)v * g_w + DESIGN_WIDTH / 2) / DESIGN_WIDTH); }
+static int sy(int v) { return (int)(((long long)v * g_h + DESIGN_HEIGHT / 2) / DESIGN_HEIGHT); }
+static int sf(int v) { int a = sx(v), b = sy(v); int r = a < b ? a : b; return r < 8 ? 8 : r; }
+
+static void safe_copy(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) return;
+    if (!src) src = "";
+
+    size_t n = strlen(src);
+    if (n >= dst_sz) n = dst_sz - 1;
+
+    if (n > 0) memcpy(dst, src, n);
+    dst[n] = '\0';
 }
 
-static inline int max_int(int a, int b) {
-    return a > b ? a : b;
-}
-
-static inline int scale_x(int v) {
-    return (int)(((long long)v * g_width + (DESIGN_WIDTH / 2)) / DESIGN_WIDTH);
-}
-
-static inline int scale_y(int v) {
-    return (int)(((long long)v * g_height + (DESIGN_HEIGHT / 2)) / DESIGN_HEIGHT);
-}
-
-static int scale_font(int v) {
-    int sx = scale_x(v);
-    int sy = scale_y(v);
-    int out = sx < sy ? sx : sy;
-    return out < 6 ? 6 : out;
-}
-
-static inline int lerp_int_simple(int a, int b, float t) {
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    return (int)((float)a + ((float)(b - a) * t));
-}
-
-static void trim_in_place(char *s) {
+static void trim(char *s) {
     if (!s) return;
-
-    char *start = s;
-    while (*start && isspace((unsigned char)*start)) start++;
-    if (start != s) memmove(s, start, strlen(start) + 1);
-
-    char *end = s + strlen(s);
-    while (end > s && isspace((unsigned char)*(end - 1))) {
-        *(--end) = '\0';
-    }
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n - 1])) s[--n] = 0;
 }
 
 static void lower_ascii(char *s) {
     if (!s) return;
-    while (*s) {
-        *s = (char)tolower((unsigned char)*s);
-        s++;
-    }
+    for (; *s; s++) *s = (char)tolower((unsigned char)*s);
 }
 
-static void copy_config_string(char *dst, size_t dst_sz, const char *src) {
-    if (!dst || dst_sz == 0) return;
-
-    if (!src || !*src) {
-        dst[0] = '\0';
-        return;
-    }
-
-    size_t src_len = strlen(src);
-    if (src_len >= dst_sz) src_len = dst_sz - 1;
-
-    memcpy(dst, src, src_len);
-    dst[src_len] = '\0';
+static bool empty_value(const char *s) {
+    if (!s) return true;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (!*s) return true;
+    char tmp[64];
+    safe_copy(tmp, sizeof(tmp), s);
+    trim(tmp);
+    lower_ascii(tmp);
+    return strcmp(tmp, "null") == 0 || strcmp(tmp, "none") == 0 || strcmp(tmp, "unknown") == 0;
 }
 
 static void normalize_state(char *dst, size_t dst_sz, const char *src) {
-    char tmp[64];
-
-    if (!dst || dst_sz == 0) return;
-
-    snprintf(tmp, sizeof(tmp), "%s", src ? src : "stop");
-    trim_in_place(tmp);
+    char tmp[32];
+    safe_copy(tmp, sizeof(tmp), src ? src : "stop");
+    trim(tmp);
     lower_ascii(tmp);
+    if (strcmp(tmp, "playing") == 0) safe_copy(dst, dst_sz, "play");
+    else if (strcmp(tmp, "paused") == 0) safe_copy(dst, dst_sz, "pause");
+    else if (strcmp(tmp, "stopped") == 0 || strcmp(tmp, "stopping") == 0 || strcmp(tmp, "idle") == 0 || tmp[0] == 0) safe_copy(dst, dst_sz, "stop");
+    else safe_copy(dst, dst_sz, tmp);
+}
 
-    if (strcmp(tmp, "playing") == 0 || strcmp(tmp, "play") == 0) {
-        snprintf(dst, dst_sz, "play");
-    } else if (strcmp(tmp, "paused") == 0 || strcmp(tmp, "pause") == 0) {
-        snprintf(dst, dst_sz, "pause");
-    } else if (strcmp(tmp, "stopped") == 0 ||
-               strcmp(tmp, "stopping") == 0 ||
-               strcmp(tmp, "stop") == 0 ||
-               strcmp(tmp, "idle") == 0 ||
-               strcmp(tmp, "") == 0) {
-        snprintf(dst, dst_sz, "stop");
-    } else {
-        snprintf(dst, dst_sz, "%s", tmp);
+static bool write_all(int fd, const char *data, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, data + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        done += (size_t)n;
     }
+    return true;
 }
 
-static bool looks_empty_value(const char *s) {
-    if (!s) return true;
-    while (*s && isspace((unsigned char)*s)) s++;
-    if (*s == '\0') return true;
+static void config_defaults(void) {
+    memset(&g_cfg, 0, sizeof(g_cfg));
+    safe_copy(g_cfg.fb_path, sizeof(g_cfg.fb_path), "/dev/fb0");
+    g_cfg.display_width = DESIGN_WIDTH;
+    g_cfg.display_height = DESIGN_HEIGHT;
+    g_cfg.clock_24h = false;
+    g_cfg.return_to_clock_seconds = 5.0;
+    g_cfg.colon_alpha_enabled = true;
+    g_cfg.colon_alpha_hz = 0.5;
+    g_cfg.colon_alpha_min = 32;
+    g_cfg.colon_alpha_max = 255;
+    g_cfg.album_bg_enabled = true;
+    g_cfg.album_bg_zoom_percent = 220;
+    g_cfg.album_bg_brightness_percent = 42;
+    g_cfg.album_bg_fade_when_title_scrolls = true;
+    g_cfg.album_bg_fade_start = 96;
+    g_cfg.album_bg_fade_end = 128;
 
-    char tmp[64];
-    snprintf(tmp, sizeof(tmp), "%s", s);
-    trim_in_place(tmp);
-    lower_ascii(tmp);
-
-    return strcmp(tmp, "null") == 0 ||
-           strcmp(tmp, "none") == 0 ||
-           strcmp(tmp, "unknown") == 0 ||
-           strcmp(tmp, "unknown track") == 0 ||
-           strcmp(tmp, "unknown artist") == 0;
+    g_cfg.ui.padding = 24;
+    g_cfg.ui.footer_height = 24;
+    g_cfg.ui.header_height = 32;
+    g_cfg.ui.progress_bar_height = 7;
+    g_cfg.ui.volume_bar_width = 20;
+    g_cfg.ui.volume_bar_height = 228;
+    g_cfg.ui.volume_bar_right_margin = 32;
+    g_cfg.ui.volume_overlay_seconds = 2;
+    g_cfg.ui.album_art_size = 150;
+    g_cfg.ui.generic_album_art_size = 136;
+    g_cfg.ui.title_font_size = 26;
+    g_cfg.ui.artist_font_size = 18;
+    g_cfg.ui.album_font_size = 15;
+    g_cfg.ui.source_font_size = 14;
+    g_cfg.ui.footer_font_size = 11;
+    g_cfg.ui.small_clock_font_size = 16;
+    g_cfg.ui.idle_clock_font_size = 132;
+    g_cfg.ui.idle_date_font_size = 20;
+    g_cfg.ui.idle_ip_font_size = 16;
+    g_cfg.ui.airplay_icon_width = 132;
+    g_cfg.ui.airplay_icon_height = 78;
+    g_cfg.ui.color_background = BG_BLACK;
+    g_cfg.ui.color_text_main = WHITE;
+    g_cfg.ui.color_text_dim = DIM;
+    g_cfg.ui.color_text_muted = MUTED;
+    g_cfg.ui.color_panel = 0x050505;
+    g_cfg.ui.color_panel_line = 0x242424;
+    g_cfg.ui.color_progress_bg = BAR_BG;
+    g_cfg.ui.color_progress_fg = BAR_FG;
+    g_cfg.ui.color_volume_bar = WHITE;
+    g_cfg.ui.color_album_placeholder = 0x181818;
 }
 
-static void copy_json_string(char *dst, size_t dst_sz, json_object *root, const char *key, const char *fallback) {
-    if (!dst || dst_sz == 0) return;
+static bool create_default_config(void) {
+    json_object *root = json_object_new_object();
+    json_object *display = json_object_new_object();
+    json_object *visual = json_object_new_object();
+    json_object *ui = json_object_new_object();
+    json_object *colors = json_object_new_object();
+    if (!root || !display || !visual || !ui || !colors) return false;
 
-    json_object *val = NULL;
-    const char *s = NULL;
+    json_object_object_add(display, "fb_path", json_object_new_string(g_cfg.fb_path));
+    json_object_object_add(display, "width", json_object_new_int(g_cfg.display_width));
+    json_object_object_add(display, "height", json_object_new_int(g_cfg.display_height));
+    json_object_object_add(display, "clock_type", json_object_new_string(g_cfg.clock_24h ? "24h" : "12h"));
+    json_object_object_add(display, "return_to_clock_seconds", json_object_new_double(g_cfg.return_to_clock_seconds));
 
-    if (root && json_object_object_get_ex(root, key, &val) && val) {
-        s = json_object_get_string(val);
-    }
+    json_object_object_add(visual, "colon_alpha_fade_enabled", json_object_new_boolean(g_cfg.colon_alpha_enabled));
+    json_object_object_add(visual, "colon_alpha_fade_hz", json_object_new_double(g_cfg.colon_alpha_hz));
+    json_object_object_add(visual, "colon_alpha_min", json_object_new_int(g_cfg.colon_alpha_min));
+    json_object_object_add(visual, "colon_alpha_max", json_object_new_int(g_cfg.colon_alpha_max));
+    json_object_object_add(visual, "album_background_enabled", json_object_new_boolean(g_cfg.album_bg_enabled));
+    json_object_object_add(visual, "album_background_zoom_percent", json_object_new_int(g_cfg.album_bg_zoom_percent));
+    json_object_object_add(visual, "album_background_brightness_percent", json_object_new_int(g_cfg.album_bg_brightness_percent));
+    json_object_object_add(visual, "album_background_diagonal_fade_when_title_scrolls", json_object_new_boolean(g_cfg.album_bg_fade_when_title_scrolls));
+    json_object_object_add(visual, "album_background_diagonal_fade_start", json_object_new_int(g_cfg.album_bg_fade_start));
+    json_object_object_add(visual, "album_background_diagonal_fade_end", json_object_new_int(g_cfg.album_bg_fade_end));
 
-    if (looks_empty_value(s)) snprintf(dst, dst_sz, "%s", fallback ? fallback : "");
-    else snprintf(dst, dst_sz, "%s", s);
-}
+    json_object_object_add(ui, "padding", json_object_new_int(g_cfg.ui.padding));
+    json_object_object_add(ui, "footer_height", json_object_new_int(g_cfg.ui.footer_height));
+    json_object_object_add(ui, "header_height", json_object_new_int(g_cfg.ui.header_height));
+    json_object_object_add(ui, "progress_bar_height", json_object_new_int(g_cfg.ui.progress_bar_height));
+    json_object_object_add(ui, "volume_bar_width", json_object_new_int(g_cfg.ui.volume_bar_width));
+    json_object_object_add(ui, "volume_bar_height", json_object_new_int(g_cfg.ui.volume_bar_height));
+    json_object_object_add(ui, "volume_bar_right_margin", json_object_new_int(g_cfg.ui.volume_bar_right_margin));
+    json_object_object_add(ui, "volume_overlay_seconds", json_object_new_int(g_cfg.ui.volume_overlay_seconds));
+    json_object_object_add(ui, "album_art_size", json_object_new_int(g_cfg.ui.album_art_size));
+    json_object_object_add(ui, "generic_album_art_size", json_object_new_int(g_cfg.ui.generic_album_art_size));
+    json_object_object_add(ui, "title_font_size", json_object_new_int(g_cfg.ui.title_font_size));
+    json_object_object_add(ui, "artist_font_size", json_object_new_int(g_cfg.ui.artist_font_size));
+    json_object_object_add(ui, "album_font_size", json_object_new_int(g_cfg.ui.album_font_size));
+    json_object_object_add(ui, "source_font_size", json_object_new_int(g_cfg.ui.source_font_size));
+    json_object_object_add(ui, "footer_font_size", json_object_new_int(g_cfg.ui.footer_font_size));
+    json_object_object_add(ui, "small_clock_font_size", json_object_new_int(g_cfg.ui.small_clock_font_size));
+    json_object_object_add(ui, "idle_clock_font_size", json_object_new_int(g_cfg.ui.idle_clock_font_size));
+    json_object_object_add(ui, "idle_date_font_size", json_object_new_int(g_cfg.ui.idle_date_font_size));
+    json_object_object_add(ui, "idle_ip_font_size", json_object_new_int(g_cfg.ui.idle_ip_font_size));
+    json_object_object_add(ui, "airplay_icon_width", json_object_new_int(g_cfg.ui.airplay_icon_width));
+    json_object_object_add(ui, "airplay_icon_height", json_object_new_int(g_cfg.ui.airplay_icon_height));
 
-static void lower_trimmed_copy(char *dst, size_t dst_sz, const char *src) {
-    if (!dst || dst_sz == 0) return;
+    json_object_object_add(colors, "background", json_object_new_string("#000000"));
+    json_object_object_add(colors, "text_main", json_object_new_string("#FFFFFF"));
+    json_object_object_add(colors, "text_dim", json_object_new_string("#AAAAAA"));
+    json_object_object_add(colors, "text_muted", json_object_new_string("#777777"));
+    json_object_object_add(colors, "panel", json_object_new_string("#050505"));
+    json_object_object_add(colors, "panel_line", json_object_new_string("#242424"));
+    json_object_object_add(colors, "progress_bg", json_object_new_string("#202020"));
+    json_object_object_add(colors, "progress_fg", json_object_new_string("#00FF00"));
+    json_object_object_add(colors, "volume_bar", json_object_new_string("#FFFFFF"));
+    json_object_object_add(colors, "album_placeholder", json_object_new_string("#181818"));
 
-    snprintf(dst, dst_sz, "%s", src ? src : "");
-    trim_in_place(dst);
-    lower_ascii(dst);
-}
+    json_object_object_add(root, "display", display);
+    json_object_object_add(root, "visual", visual);
+    json_object_object_add(root, "ui", ui);
+    json_object_object_add(root, "colors", colors);
 
-static bool string_ends_with(const char *s, const char *suffix) {
-    if (!s || !suffix) return false;
-
-    size_t s_len = strlen(s);
-    size_t suffix_len = strlen(suffix);
-    if (suffix_len > s_len) return false;
-
-    return strcmp(s + s_len - suffix_len, suffix) == 0;
-}
-
-static bool albumart_source_names_default(const char *src) {
-    char tmp[640];
-    lower_trimmed_copy(tmp, sizeof(tmp), src);
-
-    if (strstr(tmp, "default") != NULL) return true;
-    if (strstr(tmp, "placeholder") != NULL) return true;
-    if (strstr(tmp, "nocover") != NULL) return true;
-    if (strstr(tmp, "no-cover") != NULL) return true;
-    if (strstr(tmp, "noart") != NULL) return true;
-    if (strstr(tmp, "no-art") != NULL) return true;
-    if (strstr(tmp, "unknown") != NULL) return true;
-
-    return false;
-}
-
-static bool albumart_source_is_placeholder(const char *src) {
-    char tmp[640];
-    lower_trimmed_copy(tmp, sizeof(tmp), src);
-
-    if (tmp[0] == '\0') return true;
-
-    if (strcmp(tmp, "/albumart") == 0 || strcmp(tmp, "albumart") == 0) return true;
-    if (strcmp(tmp, "/albumart/") == 0 || strcmp(tmp, "albumart/") == 0) return true;
-
-    if ((strncmp(tmp, "/albumart?", 10) == 0 || strncmp(tmp, "albumart?", 9) == 0) &&
-        strstr(tmp, "cacheid=") == NULL &&
-        strstr(tmp, "path=") == NULL &&
-        strstr(tmp, "web=") == NULL) {
-        return true;
-    }
-
-    if (albumart_source_names_default(tmp)) return true;
-
-    return false;
-}
-
-static bool albumart_source_is_specific(const char *src) {
-    char tmp[640];
-    lower_trimmed_copy(tmp, sizeof(tmp), src);
-
-    if (albumart_source_is_placeholder(tmp)) return false;
-
-    if (strncmp(tmp, "http://", 7) == 0 || strncmp(tmp, "https://", 8) == 0) return true;
-
-    if (strstr(tmp, "cacheid=") != NULL) return true;
-    if (strstr(tmp, "path=") != NULL) return true;
-    if (strstr(tmp, "web=") != NULL) return true;
-
-    if (strncmp(tmp, "/albumart/", 10) == 0) return true;
-    if (strncmp(tmp, "albumart/", 9) == 0) return true;
-
-    if (string_ends_with(tmp, ".jpg") || string_ends_with(tmp, ".jpeg") ||
-        string_ends_with(tmp, ".png") || string_ends_with(tmp, ".webp")) {
-        return true;
-    }
-
-    return false;
-}
-
-
-
-static bool state_has_track_payload(void) {
-    return g_status_title[0] != '\0' ||
-           g_status_artist[0] != '\0' ||
-           g_status_album[0] != '\0' ||
-           g_status_duration > 0 ||
-           albumart_source_is_specific(g_status_albumart);
-}
-
-
-static bool current_track_has_identity(void) {
-    return g_status_title[0] != '\0' ||
-           g_status_artist[0] != '\0' ||
-           g_status_album[0] != '\0' ||
-           g_status_duration > 0;
-}
-
-static bool source_state_shows_metadata(void) {
-    return strcmp(g_status_state, "play") == 0 || strcmp(g_status_state, "pause") == 0;
-}
-
-static bool state_shows_metadata(void) {
-    if (g_pause_timeout_latched && strcmp(g_status_state, "pause") == 0) {
+    const char *txt = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
+    int fd = open(CONFIG_PATH, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        json_object_put(root);
         return false;
     }
+    bool ok = write_all(fd, txt, strlen(txt)) && write_all(fd, "\n", 1);
+    close(fd);
+    json_object_put(root);
+    return ok;
+}
 
-    return source_state_shows_metadata();
+static void parse_clock_type(const char *s) {
+    char tmp[32];
+    safe_copy(tmp, sizeof(tmp), s ? s : "");
+    trim(tmp);
+    lower_ascii(tmp);
+    if (strcmp(tmp, "24") == 0 || strcmp(tmp, "24h") == 0 || strcmp(tmp, "24-hour") == 0) g_cfg.clock_24h = true;
+    if (strcmp(tmp, "12") == 0 || strcmp(tmp, "12h") == 0 || strcmp(tmp, "12-hour") == 0) g_cfg.clock_24h = false;
+}
+
+static bool parse_hex_color(const char *s, uint32_t *out) {
+    if (!s || !out) return false;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (*s == '#') s++;
+    if (strlen(s) != 6) return false;
+    unsigned int v = 0;
+    for (int i = 0; i < 6; i++) {
+        char c = s[i];
+        unsigned int n;
+        if (c >= '0' && c <= '9') n = (unsigned int)(c - '0');
+        else if (c >= 'a' && c <= 'f') n = (unsigned int)(10 + c - 'a');
+        else if (c >= 'A' && c <= 'F') n = (unsigned int)(10 + c - 'A');
+        else return false;
+        v = (v << 4) | n;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static void read_json_int(json_object *obj, const char *key, int *dst, int min_v, int max_v) {
+    json_object *v = NULL;
+    if (!obj || !key || !dst) return;
+    if (json_object_object_get_ex(obj, key, &v) && v) {
+        *dst = clampi(json_object_get_int(v), min_v, max_v);
+    }
+}
+
+static void read_json_color(json_object *obj, const char *key, uint32_t *dst) {
+    json_object *v = NULL;
+    uint32_t color;
+    if (!obj || !key || !dst) return;
+    if (json_object_object_get_ex(obj, key, &v) && v && parse_hex_color(json_object_get_string(v), &color)) {
+        *dst = color;
+    }
+}
+
+static void load_config(void) {
+    config_defaults();
+    int fd = open(CONFIG_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) create_default_config();
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > 65536) { close(fd); return; }
+    char *buf = malloc((size_t)st.st_size + 1);
+    if (!buf) { close(fd); return; }
+    ssize_t n = read(fd, buf, (size_t)st.st_size);
+    close(fd);
+    if (n <= 0) { free(buf); return; }
+    buf[n] = 0;
+    json_object *root = json_tokener_parse(buf);
+    free(buf);
+    if (!root) return;
+
+    json_object *display = NULL, *visual = NULL, *ui = NULL, *colors = NULL, *v = NULL;
+    if (json_object_object_get_ex(root, "display", &display) && display) {
+        if (json_object_object_get_ex(display, "fb_path", &v) && v) safe_copy(g_cfg.fb_path, sizeof(g_cfg.fb_path), json_object_get_string(v));
+        if (json_object_object_get_ex(display, "width", &v) && v) g_cfg.display_width = clampi(json_object_get_int(v), 1, 8192);
+        if (json_object_object_get_ex(display, "height", &v) && v) g_cfg.display_height = clampi(json_object_get_int(v), 1, 8192);
+        if (json_object_object_get_ex(display, "clock_type", &v) && v) parse_clock_type(json_object_get_string(v));
+        if (json_object_object_get_ex(display, "return_to_clock_seconds", &v) && v) {
+            double d = json_object_get_double(v);
+            if (d >= 0.0 && d <= 3600.0) g_cfg.return_to_clock_seconds = d;
+        }
+    }
+    if (json_object_object_get_ex(root, "visual", &visual) && visual) {
+        if (json_object_object_get_ex(visual, "colon_alpha_fade_enabled", &v) && v) g_cfg.colon_alpha_enabled = json_object_get_boolean(v);
+        if (json_object_object_get_ex(visual, "colon_alpha_fade_hz", &v) && v) {
+            double d = json_object_get_double(v);
+            if (d >= 0.1 && d <= 10.0) g_cfg.colon_alpha_hz = d;
+        }
+        if (json_object_object_get_ex(visual, "colon_alpha_min", &v) && v) g_cfg.colon_alpha_min = clampi(json_object_get_int(v), 0, 255);
+        if (json_object_object_get_ex(visual, "colon_alpha_max", &v) && v) g_cfg.colon_alpha_max = clampi(json_object_get_int(v), 0, 255);
+        if (json_object_object_get_ex(visual, "album_background_enabled", &v) && v) g_cfg.album_bg_enabled = json_object_get_boolean(v);
+        if (json_object_object_get_ex(visual, "album_background_zoom_percent", &v) && v) g_cfg.album_bg_zoom_percent = clampi(json_object_get_int(v), 100, 600);
+        if (json_object_object_get_ex(visual, "album_background_brightness_percent", &v) && v) g_cfg.album_bg_brightness_percent = clampi(json_object_get_int(v), 0, 100);
+        if (json_object_object_get_ex(visual, "album_background_diagonal_fade_when_title_scrolls", &v) && v) g_cfg.album_bg_fade_when_title_scrolls = json_object_get_boolean(v);
+        if (json_object_object_get_ex(visual, "album_background_diagonal_fade_start", &v) && v) g_cfg.album_bg_fade_start = clampi(json_object_get_int(v), 0, 255);
+        if (json_object_object_get_ex(visual, "album_background_diagonal_fade_end", &v) && v) g_cfg.album_bg_fade_end = clampi(json_object_get_int(v), 0, 255);
+    }
+    if (json_object_object_get_ex(root, "ui", &ui) && ui) {
+        read_json_int(ui, "padding", &g_cfg.ui.padding, 0, 80);
+        read_json_int(ui, "footer_height", &g_cfg.ui.footer_height, 0, 80);
+        read_json_int(ui, "header_height", &g_cfg.ui.header_height, 0, 80);
+        read_json_int(ui, "progress_bar_height", &g_cfg.ui.progress_bar_height, 1, 40);
+        read_json_int(ui, "volume_bar_width", &g_cfg.ui.volume_bar_width, 4, 80);
+        read_json_int(ui, "volume_bar_height", &g_cfg.ui.volume_bar_height, 40, 400);
+        read_json_int(ui, "volume_bar_right_margin", &g_cfg.ui.volume_bar_right_margin, 0, 120);
+        read_json_int(ui, "volume_overlay_seconds", &g_cfg.ui.volume_overlay_seconds, 1, 20);
+        read_json_int(ui, "album_art_size", &g_cfg.ui.album_art_size, 48, 260);
+        read_json_int(ui, "generic_album_art_size", &g_cfg.ui.generic_album_art_size, 48, 260);
+        read_json_int(ui, "title_font_size", &g_cfg.ui.title_font_size, 10, 64);
+        read_json_int(ui, "artist_font_size", &g_cfg.ui.artist_font_size, 8, 48);
+        read_json_int(ui, "album_font_size", &g_cfg.ui.album_font_size, 8, 48);
+        read_json_int(ui, "source_font_size", &g_cfg.ui.source_font_size, 8, 36);
+        read_json_int(ui, "footer_font_size", &g_cfg.ui.footer_font_size, 8, 32);
+        read_json_int(ui, "small_clock_font_size", &g_cfg.ui.small_clock_font_size, 8, 48);
+        read_json_int(ui, "idle_clock_font_size", &g_cfg.ui.idle_clock_font_size, 40, 220);
+        read_json_int(ui, "idle_date_font_size", &g_cfg.ui.idle_date_font_size, 8, 48);
+        read_json_int(ui, "idle_ip_font_size", &g_cfg.ui.idle_ip_font_size, 8, 40);
+        read_json_int(ui, "airplay_icon_width", &g_cfg.ui.airplay_icon_width, 48, 260);
+        read_json_int(ui, "airplay_icon_height", &g_cfg.ui.airplay_icon_height, 32, 180);
+    }
+    if (json_object_object_get_ex(root, "colors", &colors) && colors) {
+        read_json_color(colors, "background", &g_cfg.ui.color_background);
+        read_json_color(colors, "text_main", &g_cfg.ui.color_text_main);
+        read_json_color(colors, "text_dim", &g_cfg.ui.color_text_dim);
+        read_json_color(colors, "text_muted", &g_cfg.ui.color_text_muted);
+        read_json_color(colors, "panel", &g_cfg.ui.color_panel);
+        read_json_color(colors, "panel_line", &g_cfg.ui.color_panel_line);
+        read_json_color(colors, "progress_bg", &g_cfg.ui.color_progress_bg);
+        read_json_color(colors, "progress_fg", &g_cfg.ui.color_progress_fg);
+        read_json_color(colors, "volume_bar", &g_cfg.ui.color_volume_bar);
+        read_json_color(colors, "album_placeholder", &g_cfg.ui.color_album_placeholder);
+    }
+    if (g_cfg.colon_alpha_min > g_cfg.colon_alpha_max) {
+        int t = g_cfg.colon_alpha_min;
+        g_cfg.colon_alpha_min = g_cfg.colon_alpha_max;
+        g_cfg.colon_alpha_max = t;
+    }
+    if (g_cfg.album_bg_fade_start >= g_cfg.album_bg_fade_end) {
+        g_cfg.album_bg_fade_start = 96;
+        g_cfg.album_bg_fade_end = 128;
+    }
+    json_object_put(root);
+}
+
+static size_t curl_write_cb(char *ptr, size_t size, size_t nmemb, void *ud) {
+    MemBuf *b = (MemBuf *)ud;
+    size_t add = size * nmemb;
+    if (!b || !ptr || add == 0) return 0;
+    if (b->len + add + 1 > HTTP_MAX_BYTES) return 0;
+    if (b->len + add + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 65536;
+        while (nc < b->len + add + 1 && nc < HTTP_MAX_BYTES) nc *= 2;
+        if (nc > HTTP_MAX_BYTES) nc = HTTP_MAX_BYTES;
+        if (nc < b->len + add + 1) return 0;
+        uint8_t *p = realloc(b->data, nc);
+        if (!p) return 0;
+        b->data = p;
+        b->cap = nc;
+    }
+    memcpy(b->data + b->len, ptr, add);
+    b->len += add;
+    b->data[b->len] = 0;
+    return add;
+}
+
+static uint8_t *http_get(const char *url, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!url || !*url || !g_running) return NULL;
+    if (!g_curl) g_curl = curl_easy_init();
+    if (!g_curl) return NULL;
+    MemBuf b = {0};
+    curl_easy_reset(g_curl);
+    curl_easy_setopt(g_curl, CURLOPT_URL, url);
+    curl_easy_setopt(g_curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(g_curl, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(g_curl, CURLOPT_USERAGENT, "volumio_fbd_truth_rebuild/1.0");
+    curl_easy_setopt(g_curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(g_curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT_MS, CURL_CONNECT_TIMEOUT_MS);
+    curl_easy_setopt(g_curl, CURLOPT_TIMEOUT_MS, CURL_TOTAL_TIMEOUT_MS);
+    curl_easy_setopt(g_curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(g_curl, CURLOPT_ACCEPT_ENCODING, "");
+    CURLcode rc = curl_easy_perform(g_curl);
+    long code = 0;
+    curl_easy_getinfo(g_curl, CURLINFO_RESPONSE_CODE, &code);
+    if (rc != CURLE_OK || code < 200 || code >= 300 || b.len == 0) {
+        free(b.data);
+        return NULL;
+    }
+    if (out_len) *out_len = b.len;
+    return b.data;
+}
+
+static bool is_plain_albumart(const char *s) {
+    if (!s) return true;
+    return strcmp(s, "/albumart") == 0 || strcmp(s, "albumart") == 0 || strcmp(s, "http://127.0.0.1:3000/albumart") == 0;
+}
+
+static bool art_is_specific(const char *s) {
+    if (empty_value(s) || is_plain_albumart(s)) return false;
+    if (strstr(s, "cacheid=") || strstr(s, "web=") || strstr(s, "path=")) return true;
+    if (strstr(s, "i.scdn.co/image/")) return true;
+    if (strstr(s, ".jpg") || strstr(s, ".jpeg") || strstr(s, ".png") || strstr(s, ".webp")) return true;
+    return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
+}
+
+static void resolve_albumart(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) return;
+    dst[0] = 0;
+    if (empty_value(src)) return;
+    if (strncmp(src, "http://", 7) == 0 || strncmp(src, "https://", 8) == 0) {
+        safe_copy(dst, dst_sz, src);
+        return;
+    }
+    if (src[0] == '/') snprintf(dst, dst_sz, "http://127.0.0.1:3000%s", src);
+    else snprintf(dst, dst_sz, "http://127.0.0.1:3000/%s", src);
+}
+
+static void json_get_string(json_object *root, const char *key, char *dst, size_t dst_sz) {
+    json_object *v = NULL;
+    const char *s = "";
+    if (root && json_object_object_get_ex(root, key, &v) && v) s = json_object_get_string(v);
+    safe_copy(dst, dst_sz, empty_value(s) ? "" : s);
+}
+
+static bool fetch_volumio(PlayerState *s) {
+    if (!s) return false;
+    size_t len = 0;
+    uint8_t *body = http_get(VOLUMIO_STATE_URL, &len);
+    if (!body) return false;
+    json_object *root = json_tokener_parse((const char *)body);
+    free(body);
+    if (!root) return false;
+
+    PlayerState n = *s;
+    char raw_status[32];
+    json_get_string(root, "status", raw_status, sizeof(raw_status));
+    normalize_state(n.state, sizeof(n.state), raw_status);
+    json_get_string(root, "service", n.service, sizeof(n.service));
+    json_get_string(root, "trackType", n.track_type, sizeof(n.track_type));
+    json_get_string(root, "title", n.title, sizeof(n.title));
+    json_get_string(root, "artist", n.artist, sizeof(n.artist));
+    json_get_string(root, "album", n.album, sizeof(n.album));
+    json_get_string(root, "albumart", n.albumart, sizeof(n.albumart));
+    json_get_string(root, "samplerate", n.samplerate, sizeof(n.samplerate));
+    json_get_string(root, "bitdepth", n.bitdepth, sizeof(n.bitdepth));
+    resolve_albumart(n.art_url, sizeof(n.art_url), n.albumart);
+
+    json_object *v = NULL;
+    n.volume = -1;
+    if (json_object_object_get_ex(root, "volume", &v) && v && json_object_get_type(v) != json_type_null) n.volume = json_object_get_int(v);
+    n.seek = 0.0;
+    if (json_object_object_get_ex(root, "seek", &v) && v && json_object_get_type(v) != json_type_null) {
+        double raw = json_object_get_double(v);
+        n.seek = raw > 10000.0 ? raw / 1000.0 : raw;
+    }
+    n.duration = 0.0;
+    if (json_object_object_get_ex(root, "duration", &v) && v && json_object_get_type(v) != json_type_null) n.duration = json_object_get_double(v);
+    json_object_put(root);
+    *s = n;
+    return true;
+}
+
+static bool file_contains(const char *path, const char *needle) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[256];
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, needle)) { ok = true; break; }
+    }
+    fclose(f);
+    return ok;
+}
+
+static bool alsa_running(void) {
+    glob_t g;
+    bool running = false;
+    if (glob("/proc/asound/card*/pcm*/sub*/status", 0, NULL, &g) != 0) return false;
+    for (size_t i = 0; i < g.gl_pathc && !running; i++) {
+        running = file_contains(g.gl_pathv[i], "state: RUNNING");
+    }
+    globfree(&g);
+    return running;
+}
+
+static void friendly_rate(char *dst, size_t dst_sz, int rate) {
+    if (!dst || dst_sz == 0) return;
+    if (rate <= 0) { dst[0] = 0; return; }
+    if (rate % 1000 == 0) snprintf(dst, dst_sz, "%d kHz", rate / 1000);
+    else snprintf(dst, dst_sz, "%.1f kHz", (double)rate / 1000.0);
+}
+
+static void friendly_format(char *dst, size_t dst_sz, const char *fmt) {
+    if (!dst || dst_sz == 0) return;
+    dst[0] = 0;
+    if (!fmt || !*fmt) return;
+    if (strstr(fmt, "S16")) safe_copy(dst, dst_sz, "16-bit");
+    else if (strstr(fmt, "S24")) safe_copy(dst, dst_sz, "24-bit");
+    else if (strstr(fmt, "S32")) safe_copy(dst, dst_sz, "32-bit");
+    else if (strstr(fmt, "FLOAT")) safe_copy(dst, dst_sz, "Float");
+    else safe_copy(dst, dst_sz, fmt);
+}
+
+static void friendly_channels(char *dst, size_t dst_sz, int ch) {
+    if (!dst || dst_sz == 0) return;
+    if (ch == 1) safe_copy(dst, dst_sz, "Mono");
+    else if (ch == 2) safe_copy(dst, dst_sz, "Stereo");
+    else if (ch == 6) safe_copy(dst, dst_sz, "5.1");
+    else if (ch == 8) safe_copy(dst, dst_sz, "7.1");
+    else if (ch > 0) snprintf(dst, dst_sz, "%dch", ch);
+    else dst[0] = 0;
+}
+
+static bool parse_hw_file(const char *path, AudioInfo *a) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[256], fmt[64] = "";
+    int rate = 0, ch = 0;
+    bool open = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "closed")) continue;
+        if (sscanf(line, "format: %63s", fmt) == 1) open = true;
+        if (sscanf(line, "channels: %d", &ch) == 1) open = true;
+        if (sscanf(line, "rate: %d", &rate) == 1) open = true;
+    }
+    fclose(f);
+    if (!open || !fmt[0] || rate <= 0 || ch <= 0) return false;
+    friendly_rate(a->rate, sizeof(a->rate), rate);
+    friendly_format(a->bits, sizeof(a->bits), fmt);
+    friendly_channels(a->channels, sizeof(a->channels), ch);
+    snprintf(a->line, sizeof(a->line), "%s / %s / %s", a->rate, a->bits, a->channels);
+    return true;
+}
+
+static void read_alsa(AudioInfo *a) {
+    memset(a, 0, sizeof(*a));
+    a->running = alsa_running();
+    glob_t g;
+    if (glob("/proc/asound/card*/pcm*/sub*/hw_params", 0, NULL, &g) != 0) return;
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        if (parse_hw_file(g.gl_pathv[i], a)) break;
+    }
+    globfree(&g);
+}
+
+static uint32_t pack_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    uint32_t pr = ((uint32_t)r * ((1u << g_vinfo.red.length) - 1u) + 127u) / 255u;
+    uint32_t pg = ((uint32_t)g * ((1u << g_vinfo.green.length) - 1u) + 127u) / 255u;
+    uint32_t pb = ((uint32_t)b * ((1u << g_vinfo.blue.length) - 1u) + 127u) / 255u;
+    return (pr << g_vinfo.red.offset) | (pg << g_vinfo.green.offset) | (pb << g_vinfo.blue.offset);
+}
+
+static bool fb_init(void) {
+    g_fb_fd = open(g_cfg.fb_path, O_RDWR | O_CLOEXEC);
+    if (g_fb_fd < 0) { perror("open fb"); return false; }
+    if (ioctl(g_fb_fd, FBIOGET_FSCREENINFO, &g_finfo) != 0 || ioctl(g_fb_fd, FBIOGET_VSCREENINFO, &g_vinfo) != 0) {
+        perror("fb ioctl"); return false;
+    }
+    int fb_w = (int)g_vinfo.xres;
+    int fb_h = (int)g_vinfo.yres;
+    g_w = clampi(g_cfg.display_width > 0 ? g_cfg.display_width : fb_w, 1, fb_w);
+    g_h = clampi(g_cfg.display_height > 0 ? g_cfg.display_height : fb_h, 1, fb_h);
+    g_bpp = (int)g_vinfo.bits_per_pixel;
+    g_stride = (int)g_finfo.line_length;
+    g_fb_bytes = (size_t)g_stride * (size_t)fb_h;
+    g_fb = mmap(NULL, g_fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
+    if (g_fb == MAP_FAILED) { perror("mmap fb"); g_fb = NULL; return false; }
+    g_img = calloc((size_t)g_w * (size_t)g_h * 3u, 1);
+    g_prev_img = calloc((size_t)g_w * (size_t)g_h * 3u, 1);
+    g_dirty_spans = calloc((size_t)g_h, sizeof(DirtySpan));
+    return g_img != NULL && g_prev_img != NULL && g_dirty_spans != NULL;
+}
+
+static void fb_flush(void) {
+    if (!g_fb || !g_img || !g_prev_img || !g_dirty_spans) return;
+
+    for (int y = 0; y < g_h; y++) {
+        DirtySpan *spn = &g_dirty_spans[y];
+        spn->dirty = false;
+        spn->min_x = g_w;
+        spn->max_x = -1;
+
+        uint8_t *cur = g_img + (size_t)y * (size_t)g_w * 3u;
+        uint8_t *prev = g_prev_img + (size_t)y * (size_t)g_w * 3u;
+
+        if (!g_prev_valid) {
+            spn->dirty = true;
+            spn->min_x = 0;
+            spn->max_x = g_w - 1;
+            memcpy(prev, cur, (size_t)g_w * 3u);
+            continue;
+        }
+
+        for (int x = 0; x < g_w; x++) {
+            size_t i = (size_t)x * 3u;
+            if (cur[i + 0] != prev[i + 0] || cur[i + 1] != prev[i + 1] || cur[i + 2] != prev[i + 2]) {
+                if (!spn->dirty) {
+                    spn->dirty = true;
+                    spn->min_x = x;
+                }
+                spn->max_x = x;
+                prev[i + 0] = cur[i + 0];
+                prev[i + 1] = cur[i + 1];
+                prev[i + 2] = cur[i + 2];
+            }
+        }
+    }
+
+    for (int y = 0; y < g_h; y++) {
+        DirtySpan *spn = &g_dirty_spans[y];
+        if (!spn->dirty || spn->max_x < spn->min_x) continue;
+
+        int x0 = clampi(spn->min_x, 0, g_w - 1);
+        int x1 = clampi(spn->max_x, 0, g_w - 1);
+        uint8_t *dst = g_fb + (size_t)y * (size_t)g_stride;
+        uint8_t *src = g_img + (size_t)y * (size_t)g_w * 3u;
+
+        for (int x = x0; x <= x1; x++) {
+            uint8_t r = src[x * 3 + 0], gg = src[x * 3 + 1], b = src[x * 3 + 2];
+            uint32_t pix = pack_rgb(r, gg, b);
+            if (g_bpp == 16) ((uint16_t *)dst)[x] = (uint16_t)pix;
+            else if (g_bpp == 24) {
+                dst[x * 3 + 0] = (uint8_t)(pix & 0xff);
+                dst[x * 3 + 1] = (uint8_t)((pix >> 8) & 0xff);
+                dst[x * 3 + 2] = (uint8_t)((pix >> 16) & 0xff);
+            } else if (g_bpp == 32) ((uint32_t *)dst)[x] = pix;
+        }
+    }
+
+    g_prev_valid = true;
+}
+
+static void clear_screen(uint32_t color) {
+    uint8_t r = (uint8_t)((color >> 16) & 0xff), g = (uint8_t)((color >> 8) & 0xff), b = (uint8_t)(color & 0xff);
+    for (int i = 0; i < g_w * g_h; i++) { g_img[i * 3] = r; g_img[i * 3 + 1] = g; g_img[i * 3 + 2] = b; }
+}
+
+static void put_pixel(int x, int y, uint32_t color) {
+    if (x < 0 || y < 0 || x >= g_w || y >= g_h) return;
+    size_t i = ((size_t)y * (size_t)g_w + (size_t)x) * 3u;
+    g_img[i + 0] = (uint8_t)((color >> 16) & 0xff);
+    g_img[i + 1] = (uint8_t)((color >> 8) & 0xff);
+    g_img[i + 2] = (uint8_t)(color & 0xff);
+}
+
+static void fill_rect(int x, int y, int w, int h, uint32_t color) {
+    int x0 = clampi(x, 0, g_w), y0 = clampi(y, 0, g_h), x1 = clampi(x + w, 0, g_w), y1 = clampi(y + h, 0, g_h);
+    for (int yy = y0; yy < y1; yy++) for (int xx = x0; xx < x1; xx++) put_pixel(xx, yy, color);
+}
+
+static void blend_pixel(int x, int y, uint32_t color, int alpha) {
+    if (x < 0 || y < 0 || x >= g_w || y >= g_h || alpha <= 0) return;
+    if (alpha > 255) alpha = 255;
+    size_t i = ((size_t)y * (size_t)g_w + (size_t)x) * 3u;
+    int sr = (color >> 16) & 0xff, sg = (color >> 8) & 0xff, sb = color & 0xff;
+    g_img[i + 0] = (uint8_t)((sr * alpha + g_img[i + 0] * (255 - alpha)) / 255);
+    g_img[i + 1] = (uint8_t)((sg * alpha + g_img[i + 1] * (255 - alpha)) / 255);
+    g_img[i + 2] = (uint8_t)((sb * alpha + g_img[i + 2] * (255 - alpha)) / 255);
+}
+
+static void fill_rect_alpha(int x, int y, int w, int h, uint32_t color, int alpha) {
+    int x0 = clampi(x, 0, g_w), y0 = clampi(y, 0, g_h), x1 = clampi(x + w, 0, g_w), y1 = clampi(y + h, 0, g_h);
+    for (int yy = y0; yy < y1; yy++) {
+        for (int xx = x0; xx < x1; xx++) {
+            blend_pixel(xx, yy, color, alpha);
+        }
+    }
+}
+
+static bool fonts_init(void) {
+    if (FT_Init_FreeType(&g_ft) != 0) return false;
+    if (FT_New_Face(g_ft, FONT_BOLD, 0, &g_font_bold) != 0) return false;
+    if (FT_New_Face(g_ft, FONT_REG, 0, &g_font_reg) != 0) return false;
+    return true;
+}
+
+static unsigned int glyph_hash(FT_Face face, int px, unsigned int cp) {
+    uintptr_t f = (uintptr_t)face;
+    return (unsigned int)((f >> 4) ^ (uintptr_t)f ^ ((unsigned int)px * 131u) ^ (cp * 2654435761u));
+}
+
+static GlyphCacheEntry *glyph_cache_get(FT_Face face, int px, unsigned int cp) {
+    if (!face || px <= 0) return NULL;
+    unsigned int start = glyph_hash(face, px, cp) % GLYPH_CACHE_SLOTS;
+
+    for (unsigned int probe = 0; probe < GLYPH_CACHE_SLOTS; probe++) {
+        unsigned int idx = (start + probe) % GLYPH_CACHE_SLOTS;
+        GlyphCacheEntry *e = &g_glyph_cache[idx];
+
+        if (e->valid && e->face == face && e->px == px && e->codepoint == cp) return e;
+
+        if (!e->valid) {
+            FT_Set_Pixel_Sizes(face, 0, (FT_UInt)px);
+            if (FT_Load_Char(face, cp, FT_LOAD_RENDER) != 0) return NULL;
+            FT_GlyphSlot g = face->glyph;
+
+            memset(e, 0, sizeof(*e));
+            e->valid = true;
+            e->face = face;
+            e->px = px;
+            e->codepoint = cp;
+            e->width = (int)g->bitmap.width;
+            e->height = (int)g->bitmap.rows;
+            e->advance = (int)(g->advance.x >> 6);
+            e->left = g->bitmap_left;
+            e->top = g->bitmap_top;
+
+            if (e->width > 0 && e->height > 0) {
+                e->alpha = malloc((size_t)e->width * (size_t)e->height);
+                if (!e->alpha) {
+                    e->valid = false;
+                    return NULL;
+                }
+                for (int row = 0; row < e->height; row++) {
+                    memcpy(e->alpha + (size_t)row * e->width,
+                           g->bitmap.buffer + (size_t)row * g->bitmap.pitch,
+                           (size_t)e->width);
+                }
+            }
+            return e;
+        }
+    }
+
+    /* Cache is full. Reuse a deterministic slot. */
+    GlyphCacheEntry *e = &g_glyph_cache[start];
+    free(e->alpha);
+    memset(e, 0, sizeof(*e));
+    return glyph_cache_get(face, px, cp);
+}
+
+static int text_width(FT_Face face, int px, const char *s) {
+    if (!face || !s) return 0;
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        GlyphCacheEntry *g = glyph_cache_get(face, px, *p);
+        if (g) w += g->advance;
+    }
+    return w;
+}
+
+static void draw_text_clip(FT_Face face, int px, int x, int y, const char *s, uint32_t color, int alpha, int clip_x0, int clip_y0, int clip_x1, int clip_y1) {
+    if (!face || !s || !*s || alpha <= 0) return;
+    int pen_x = x;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        GlyphCacheEntry *g = glyph_cache_get(face, px, *p);
+        if (!g) continue;
+
+        int gx = pen_x + g->left;
+        int gy = y - g->top;
+        for (int row = 0; row < g->height; row++) {
+            int yy = gy + row;
+            if (yy < clip_y0 || yy >= clip_y1) continue;
+            for (int col = 0; col < g->width; col++) {
+                int xx = gx + col;
+                if (xx < clip_x0 || xx >= clip_x1) continue;
+                int a = (g->alpha[(size_t)row * g->width + col] * alpha) / 255;
+                blend_pixel(xx, yy, color, a);
+            }
+        }
+        pen_x += g->advance;
+    }
+}
+
+static void draw_text(FT_Face face, int px, int x, int y, const char *s, uint32_t color) {
+    draw_text_clip(face, px, x, y, s, color, 255, 0, 0, g_w, g_h);
+}
+
+static int colon_alpha(double now) {
+    if (!g_cfg.colon_alpha_enabled) return 255;
+    double phase = fmod(now * g_cfg.colon_alpha_hz, 1.0);
+    if (phase < 0) phase += 1.0;
+    double wave = (sin(phase * 2.0 * M_PI - M_PI / 2.0) + 1.0) * 0.5;
+    return clampi((int)(g_cfg.colon_alpha_min + wave * (g_cfg.colon_alpha_max - g_cfg.colon_alpha_min)), 0, 255);
+}
+
+static void format_time(char *dst, size_t dst_sz) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    if (g_cfg.clock_24h) strftime(dst, dst_sz, "%H:%M", &tmv);
+    else {
+        strftime(dst, dst_sz, "%I:%M", &tmv);
+        if (dst[0] == '0') memmove(dst, dst + 1, strlen(dst));
+    }
+}
+
+static void draw_clock_text(int cx, int baseline, int px, uint32_t color, double now) {
+    char t[32];
+    format_time(t, sizeof(t));
+    char *c = strchr(t, ':');
+    if (!c) { draw_text(g_font_bold, px, cx - text_width(g_font_bold, px, t) / 2, baseline, t, color); return; }
+    char left[16], right[16];
+    size_t ln = (size_t)(c - t);
+    memcpy(left, t, ln); left[ln] = 0;
+    safe_copy(right, sizeof(right), c + 1);
+    int wl = text_width(g_font_bold, px, left);
+    int wc = text_width(g_font_bold, px, ":");
+    int wr = text_width(g_font_bold, px, right);
+    int x = cx - (wl + wc + wr) / 2;
+    draw_text(g_font_bold, px, x, baseline, left, color);
+    draw_text_clip(g_font_bold, px, x + wl, baseline, ":", color, colon_alpha(now), 0, 0, g_w, g_h);
+    draw_text(g_font_bold, px, x + wl + wc, baseline, right, color);
 }
 
 static void free_scaled_art(void) {
-    if (g_art_scaled_rgb) {
-        free(g_art_scaled_rgb);
-        g_art_scaled_rgb = NULL;
-    }
-    g_cached_art_w = 0;
-    g_cached_art_h = 0;
+    free(g_art_scaled_rgb);
+    g_art_scaled_rgb = NULL;
+    g_art_scaled_w = 0;
+    g_art_scaled_h = 0;
     g_art_scaled_generation = 0;
 }
 
-static void mark_album_art_changed(const char *reason) {
-    g_art_generation++;
-    if (g_art_generation == 0) g_art_generation = 1;
+static bool ensure_scaled_art(int dw, int dh) {
+    if (!g_art_rgba || g_art_w <= 0 || g_art_h <= 0 || dw <= 0 || dh <= 0) return false;
+    if (g_art_scaled_rgb && g_art_scaled_w == dw && g_art_scaled_h == dh && g_art_scaled_generation == g_art_generation) return true;
 
     free_scaled_art();
-    g_album_bg_generation = 0;
-    g_prev_frame_valid = false;
+    g_art_scaled_rgb = malloc((size_t)dw * (size_t)dh * 3u);
+    if (!g_art_scaled_rgb) return false;
+    g_art_scaled_w = dw;
+    g_art_scaled_h = dh;
+    g_art_scaled_generation = g_art_generation;
 
-    DBG_LOG("Album art dirty: reason=%s generation=%lu url='%s' track='%s' fallback=%s",
-            reason ? reason : "unknown",
-            g_art_generation,
-            g_art_loaded_url,
-            g_art_loaded_track_key,
-            g_art_is_default_fallback ? (g_art_is_pulse_fallback ? "pulse" : "true") : "false");
+    for (int y = 0; y < dh; y++) {
+        int syy = (int)((long long)y * g_art_h / dh);
+        for (int x = 0; x < dw; x++) {
+            int sxx = (int)((long long)x * g_art_w / dw);
+            uint8_t *sp = g_art_rgba + ((size_t)syy * g_art_w + sxx) * 4u;
+            uint8_t *dp = g_art_scaled_rgb + ((size_t)y * dw + x) * 3u;
+            int a = sp[3];
+            dp[0] = (uint8_t)(sp[0] * a / 255);
+            dp[1] = (uint8_t)(sp[1] * a / 255);
+            dp[2] = (uint8_t)(sp[2] * a / 255);
+        }
+    }
+    return true;
 }
 
-static void reset_album_art_lookup_timing(void) {
-    g_art_last_check_at = -1.0;
-    g_art_lookup_track_key[0] = '\0';
-    g_art_lookup_track_since = -1.0;
+static void draw_cached_album_art(int dx, int dy, int dw, int dh) {
+    if (!ensure_scaled_art(dw, dh)) return;
+    for (int y = 0; y < dh; y++) {
+        int yy = dy + y;
+        if (yy < 0 || yy >= g_h) continue;
+        for (int x = 0; x < dw; x++) {
+            int xx = dx + x;
+            if (xx < 0 || xx >= g_w) continue;
+            uint8_t *sp = g_art_scaled_rgb + ((size_t)y * dw + x) * 3u;
+            size_t di = ((size_t)yy * g_w + xx) * 3u;
+            g_img[di + 0] = sp[0];
+            g_img[di + 1] = sp[1];
+            g_img[di + 2] = sp[2];
+        }
+    }
 }
 
-static void build_current_track_key(char *dst, size_t dst_sz) {
+static bool load_album_art(const char *url) {
+    if (!url || !*url || !art_is_specific(url)) return false;
+    if (strcmp(url, g_art_url) == 0 && g_art_rgba) return true;
+    size_t len = 0;
+    uint8_t *buf = http_get(url, &len);
+    if (!buf) return false;
+    int w = 0, h = 0, comp = 0;
+    uint8_t *img = stbi_load_from_memory(buf, (int)len, &w, &h, &comp, 4);
+    free(buf);
+    if (!img || w <= 0 || h <= 0) { if (img) stbi_image_free(img); return false; }
+    if (g_art_rgba) stbi_image_free(g_art_rgba);
+    g_art_rgba = img;
+    g_art_w = w;
+    g_art_h = h;
+    safe_copy(g_art_url, sizeof(g_art_url), url);
+    g_art_generation++;
+    if (g_art_generation == 0) g_art_generation = 1;
+    free_scaled_art();
+    g_bg_generation = 0;
+    return true;
+}
+
+static void clear_art(void) {
+    if (g_art_rgba) stbi_image_free(g_art_rgba);
+    g_art_rgba = NULL;
+    g_art_w = g_art_h = 0;
+    g_art_url[0] = 0;
+    g_art_generation++;
+    free_scaled_art();
+    g_bg_generation = 0;
+}
+
+static void update_art_for_state(const PlayerState *s, bool screen_clock) {
+    bool is_airplay = strcmp(s->service, "airplay_emulation") == 0 || strcmp(s->track_type, "airplay") == 0;
+    if (screen_clock || is_airplay) { clear_art(); return; }
+    if (art_is_specific(s->art_url)) load_album_art(s->art_url);
+}
+
+static void build_album_background(bool fade) {
+    if (!g_art_rgba || !g_cfg.album_bg_enabled) return;
+    if (g_bg_rgb && g_bg_w == g_w && g_bg_h == g_h && g_bg_generation == g_art_generation && g_bg_fade == fade && g_bg_brightness == g_cfg.album_bg_brightness_percent && g_bg_zoom == g_cfg.album_bg_zoom_percent) return;
+    free(g_bg_rgb);
+    g_bg_rgb = calloc((size_t)g_w * (size_t)g_h * 3u, 1);
+    if (!g_bg_rgb) return;
+    g_bg_w = g_w; g_bg_h = g_h; g_bg_fade = fade; g_bg_generation = g_art_generation;
+    g_bg_brightness = g_cfg.album_bg_brightness_percent; g_bg_zoom = g_cfg.album_bg_zoom_percent;
+
+    int base = max_i(g_w, g_h);
+    int dst_size = base * g_cfg.album_bg_zoom_percent / 100;
+    int dx = (g_w - dst_size) / 2;
+    int dy = (g_h - dst_size) / 2;
+    int width_denom = max_i(1, g_w - 1);
+    int height_denom = max_i(1, g_h - 1);
+    int fade_start = g_cfg.album_bg_fade_start;
+    int fade_end = g_cfg.album_bg_fade_end;
+    int bright = clampi(g_cfg.album_bg_brightness_percent, 0, 100);
+
+    for (int y = 0; y < g_h; y++) {
+        for (int x = 0; x < g_w; x++) {
+            int sx0 = (int)((long long)(x - dx) * g_art_w / dst_size);
+            int sy0 = (int)((long long)(y - dy) * g_art_h / dst_size);
+            if (sx0 < 0 || sy0 < 0 || sx0 >= g_art_w || sy0 >= g_art_h) continue;
+            uint8_t *sp = g_art_rgba + ((size_t)sy0 * g_art_w + sx0) * 4u;
+            int br = sp[0] * bright / 100;
+            int bg = sp[1] * bright / 100;
+            int bb = sp[2] * bright / 100;
+            int keep = 255;
+            if (fade) {
+                int nx255 = x * 255 / width_denom;
+                int invy255 = (g_h - 1 - y) * 255 / height_denom;
+                int diag = (nx255 + invy255) / 2;
+                if (diag <= fade_start) keep = 255;
+                else if (diag >= fade_end) keep = 0;
+                else keep = 255 - (255 * (diag - fade_start) / max_i(1, fade_end - fade_start));
+            }
+            uint8_t *dp = g_bg_rgb + ((size_t)y * g_w + x) * 3u;
+            dp[0] = (uint8_t)(br * keep / 255);
+            dp[1] = (uint8_t)(bg * keep / 255);
+            dp[2] = (uint8_t)(bb * keep / 255);
+        }
+    }
+}
+
+static void draw_album_background(bool fade) {
+    if (!g_art_rgba || !g_cfg.album_bg_enabled) { clear_screen(g_cfg.ui.color_background); return; }
+    build_album_background(fade);
+    if (g_bg_rgb) memcpy(g_img, g_bg_rgb, (size_t)g_w * g_h * 3u);
+    else clear_screen(g_cfg.ui.color_background);
+}
+
+static bool is_spotify(const PlayerState *s) { return strcmp(s->service, "spop") == 0 || strcmp(s->track_type, "spotify") == 0; }
+static bool is_airplay(const PlayerState *s) { return strcmp(s->service, "airplay_emulation") == 0 || strcmp(s->track_type, "airplay") == 0; }
+static bool is_real_idle(const PlayerState *s) { return strcmp(s->state, "stop") == 0 && strcmp(s->service, "mpd") == 0 && s->title[0] == 0 && s->duration <= 0.0; }
+
+static void format_source_truth(const PlayerState *s, char *dst, size_t dst_sz) {
     if (!dst || dst_sz == 0) return;
+    const char *src = "Volumio";
+    if (is_spotify(s)) src = "Spotify";
+    else if (is_airplay(s)) src = "AirPlay";
+    else if (s->service[0]) src = s->service;
+    else if (s->track_type[0]) src = s->track_type;
 
-    snprintf(dst, dst_sz, "%s|%s|%s|%d",
-             g_status_title,
-             g_status_artist,
-             g_status_album,
-             g_status_duration);
+    const char *state = s->state[0] ? s->state : "unknown";
+    if (is_real_idle(s)) snprintf(dst, dst_sz, "Clock");
+    else snprintf(dst, dst_sz, "%s | %s", src, state);
 }
 
-static void clear_album_art_pixels(void) {
-    bool had_art_state = g_art_rgba || g_art_scaled_rgb ||
-                         g_art_w > 0 || g_art_h > 0 ||
-                         g_art_loaded_url[0] || g_art_loaded_track_key[0] ||
-                         g_art_is_default_fallback || g_art_is_pulse_fallback;
+static void compact_audio_format(const AudioInfo *a, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    dst[0] = '\0';
 
-    if (g_art_rgba) {
-        stbi_image_free(g_art_rgba);
-        g_art_rgba = NULL;
-    }
-
-    g_art_w = 0;
-    g_art_h = 0;
-    g_art_loaded_url[0] = '\0';
-    g_art_loaded_track_key[0] = '\0';
-    g_art_is_default_fallback = false;
-    g_art_is_pulse_fallback = false;
-
-    if (had_art_state) {
-        mark_album_art_changed("cleared");
-    } else {
-        free_scaled_art();
-    }
-}
-
-static void force_large_clock_state(const char *reason) {
-    DBG_LOG("Returning to large clock: reason=%s state=%s title='%s' duration=%d",
-            reason ? reason : "unknown", g_status_state, g_status_title, g_status_duration);
-
-    snprintf(g_status_state, sizeof(g_status_state), "stop");
-    g_status_seek = 0;
-    g_status_duration = 0;
-    g_status_title[0] = '\0';
-    g_status_artist[0] = '\0';
-    g_status_album[0] = '\0';
-    g_status_albumart[0] = '\0';
-    g_status_track_type[0] = '\0';
-    g_status_samplerate[0] = '\0';
-    g_status_bitdepth[0] = '\0';
-    g_art_loaded_url[0] = '\0';
-    g_art_last_check_at = -1.0;
-    g_no_metadata_started_at = -1.0;
-    g_status_fetch_failed_started_at = -1.0;
-    g_wait_timeout_latched = true;
-    g_pause_timeout_started_at = -1.0;
-    g_pause_timeout_latched = false;
-    g_pause_timeout_track_key[0] = '\0';
-    g_pause_timeout_last_log_at = -1.0;
-
-    clear_album_art_pixels();
-    free_scroll_strip();
-}
-
-static void clear_track_payload_only(void) {
-    g_status_seek = 0;
-    g_status_duration = 0;
-    g_status_title[0] = '\0';
-    g_status_artist[0] = '\0';
-    g_status_album[0] = '\0';
-    g_status_albumart[0] = '\0';
-    g_status_track_type[0] = '\0';
-    g_status_samplerate[0] = '\0';
-    g_status_bitdepth[0] = '\0';
-    g_art_loaded_url[0] = '\0';
-    g_art_last_check_at = -1.0;
-    g_pause_timeout_started_at = -1.0;
-    g_pause_timeout_latched = false;
-    g_pause_timeout_track_key[0] = '\0';
-    g_pause_timeout_last_log_at = -1.0;
-
-    clear_album_art_pixels();
-    free_scroll_strip();
-}
-
-static bool suppress_metadata_less_playback_if_latched(double now) {
-    if (!g_wait_timeout_latched) return false;
-
-    if (source_state_shows_metadata() && !state_has_track_payload()) {
-        if (g_last_latch_log_at < 0.0 || now - g_last_latch_log_at >= 5.0) {
-            DBG_LOG("Wait-timeout latch active: suppressing metadata-less playback state=%s albumart='%s'",
-                    g_status_state, g_status_albumart);
-            g_last_latch_log_at = now;
-        }
-
-        snprintf(g_status_state, sizeof(g_status_state), "stop");
-        clear_track_payload_only();
-        g_no_metadata_started_at = -1.0;
-        return true;
-    }
-
-    if (state_has_track_payload()) {
-        DBG_LOG("Wait-timeout latch cleared: real metadata returned state=%s title='%s' duration=%d albumart='%s'",
-                g_status_state, g_status_title, g_status_duration, g_status_albumart);
-        g_wait_timeout_latched = false;
-        g_last_latch_log_at = -1.0;
-    }
-
-    return false;
-}
-
-static void reset_pause_timeout_state(void) {
-    g_pause_timeout_started_at = -1.0;
-    g_pause_timeout_latched = false;
-    g_pause_timeout_track_key[0] = '\0';
-    g_pause_timeout_last_log_at = -1.0;
-}
-
-static void apply_pause_timeout(double now) {
-    if (g_cfg_wait_timeout_seconds <= 0.0) {
-        reset_pause_timeout_state();
+    if (!a || !a->line[0]) {
+        snprintf(dst, dst_sz, "closed");
         return;
     }
 
-    if (strcmp(g_status_state, "pause") != 0) {
-        reset_pause_timeout_state();
-        return;
-    }
+    char rate[24] = "";
+    char bits[24] = "";
+    char chans[24] = "";
+    safe_copy(rate, sizeof(rate), a->rate);
+    safe_copy(bits, sizeof(bits), a->bits);
+    safe_copy(chans, sizeof(chans), a->channels);
 
-    char track_key[sizeof(g_pause_timeout_track_key)];
-    build_current_track_key(track_key, sizeof(track_key));
+    char *p = strstr(rate, " kHz");
+    if (p) *p = '\0';
 
-    if (track_key[0] == '\0' || strcmp(track_key, "|||0") == 0) {
-        snprintf(track_key, sizeof(track_key), "pause|%s|%s|%d",
-                 g_status_albumart, g_status_track_type, g_status_seek);
-    }
+    p = strstr(bits, "-bit");
+    if (p) *p = '\0';
 
-    if (g_pause_timeout_started_at < 0.0 || strcmp(track_key, g_pause_timeout_track_key) != 0) {
-        snprintf(g_pause_timeout_track_key, sizeof(g_pause_timeout_track_key), "%s", track_key);
-        g_pause_timeout_started_at = now;
-        g_pause_timeout_latched = false;
-        g_pause_timeout_last_log_at = -1.0;
+    if (strcmp(chans, "Stereo") == 0) safe_copy(chans, sizeof(chans), "St");
+    else if (strcmp(chans, "Mono") == 0) safe_copy(chans, sizeof(chans), "Mo");
 
-        DBG_LOG("Pause timeout timer started: state=%s title='%s' source='%s' limit=%.2f",
-                g_status_state, g_status_title, g_status_track_type, g_cfg_wait_timeout_seconds);
-        return;
-    }
-
-    if (g_pause_timeout_latched) {
-        if (g_pause_timeout_last_log_at < 0.0 || now - g_pause_timeout_last_log_at >= 5.0) {
-            DBG_LOG("Pause timeout latch active: suppressing paused metadata title='%s' source='%s'",
-                    g_status_title, g_status_track_type);
-            g_pause_timeout_last_log_at = now;
-        }
-        return;
-    }
-
-    if (now - g_pause_timeout_started_at >= g_cfg_wait_timeout_seconds) {
-        g_pause_timeout_latched = true;
-        g_pause_timeout_last_log_at = now;
-        DBG_LOG("Pause timeout reached: returning display to large clock title='%s' source='%s' elapsed=%.2f",
-                g_status_title, g_status_track_type, now - g_pause_timeout_started_at);
-    }
+    if (rate[0] && bits[0] && chans[0]) snprintf(dst, dst_sz, "%s/%s/%s", rate, bits, chans);
+    else safe_copy(dst, dst_sz, a->line);
 }
 
-static void apply_wait_timeout(double now) {
-    if (g_cfg_wait_timeout_seconds <= 0.0) {
-        g_no_metadata_started_at = -1.0;
-        reset_pause_timeout_state();
-        return;
+static void format_clock_countdown(double now, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    dst[0] = '\0';
+
+    if (g_audio_stopped_at >= 0.0 && g_cfg.return_to_clock_seconds > 0.0) {
+        double left = g_cfg.return_to_clock_seconds - (now - g_audio_stopped_at);
+        if (left < 0.0) left = 0.0;
+        snprintf(dst, dst_sz, "Clock %.0fs", ceil(left));
     }
-
-    apply_pause_timeout(now);
-
-    if (g_pause_timeout_latched && strcmp(g_status_state, "pause") == 0) {
-        g_no_metadata_started_at = -1.0;
-        return;
-    }
-
-    if (source_state_shows_metadata() && !state_has_track_payload()) {
-        if (g_no_metadata_started_at < 0.0) {
-            g_no_metadata_started_at = now;
-            DBG_LOG("No metadata while in playback state. timeout_started state=%s limit=%.2f",
-                    g_status_state, g_cfg_wait_timeout_seconds);
-        }
-
-        if (now - g_no_metadata_started_at >= g_cfg_wait_timeout_seconds) {
-            force_large_clock_state("no metadata timeout");
-        }
-    } else {
-        g_no_metadata_started_at = -1.0;
-    }
-}
-
-
-static int interface_ipv4_priority(const char *name) {
-    if (!name || !*name) return 0;
-
-    if (strncmp(name, "eth", 3) == 0) return 100;
-    if (strncmp(name, "en", 2) == 0) return 95;
-    if (strncmp(name, "wlan", 4) == 0) return 90;
-    if (strncmp(name, "wl", 2) == 0) return 85;
-    if (strncmp(name, "usb", 3) == 0) return 80;
-
-    if (strncmp(name, "lo", 2) == 0) return 0;
-    if (strncmp(name, "docker", 6) == 0) return 0;
-    if (strncmp(name, "br-", 3) == 0) return 0;
-    if (strncmp(name, "veth", 4) == 0) return 0;
-    if (strncmp(name, "tun", 3) == 0) return 0;
-    if (strncmp(name, "tap", 3) == 0) return 0;
-
-    return 50;
 }
 
 static bool get_primary_ipv4(char *dst, size_t dst_sz) {
     if (!dst || dst_sz == 0) return false;
-
-    snprintf(dst, dst_sz, "No IP");
+    safe_copy(dst, dst_sz, "No IP");
 
     struct ifaddrs *ifaddr = NULL;
-    if (getifaddrs(&ifaddr) != 0) {
-        return false;
-    }
+    if (getifaddrs(&ifaddr) != 0) return false;
 
     int best_score = 0;
     char best_ip[INET_ADDRSTRLEN] = "";
@@ -899,3241 +1242,448 @@ static bool get_primary_ipv4(char *dst, size_t dst_sz) {
         if (!(ifa->ifa_flags & IFF_UP)) continue;
         if (ifa->ifa_flags & IFF_LOOPBACK) continue;
 
-        int score = interface_ipv4_priority(ifa->ifa_name);
-        if (score <= 0) continue;
+        int score = 50;
+        if (strncmp(ifa->ifa_name, "eth", 3) == 0) score = 100;
+        else if (strncmp(ifa->ifa_name, "en", 2) == 0) score = 95;
+        else if (strncmp(ifa->ifa_name, "wlan", 4) == 0) score = 90;
+        else if (strncmp(ifa->ifa_name, "wl", 2) == 0) score = 85;
+        else if (strncmp(ifa->ifa_name, "lo", 2) == 0 || strncmp(ifa->ifa_name, "docker", 6) == 0 ||
+                 strncmp(ifa->ifa_name, "br-", 3) == 0 || strncmp(ifa->ifa_name, "veth", 4) == 0 ||
+                 strncmp(ifa->ifa_name, "tun", 3) == 0 || strncmp(ifa->ifa_name, "tap", 3) == 0) score = 0;
+        if (score <= best_score) continue;
 
         struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
         char ip[INET_ADDRSTRLEN];
-
         if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+        if (strncmp(ip, "127.", 4) == 0 || strncmp(ip, "169.254.", 8) == 0) continue;
 
-        if (strncmp(ip, "127.", 4) == 0) continue;
-        if (strncmp(ip, "169.254.", 8) == 0) continue;
-
-        if (score > best_score) {
-            best_score = score;
-            snprintf(best_ip, sizeof(best_ip), "%s", ip);
-        }
+        best_score = score;
+        safe_copy(best_ip, sizeof(best_ip), ip);
     }
 
     freeifaddrs(ifaddr);
 
     if (best_ip[0]) {
-        snprintf(dst, dst_sz, "%s", best_ip);
+        safe_copy(dst, dst_sz, best_ip);
         return true;
     }
-
     return false;
 }
 
-static void format_idle_date(char *dst, size_t dst_sz, const struct tm *tm_value) {
-    if (!dst || dst_sz == 0) return;
+static void update_volume_overlay(const PlayerState *s, double now) {
+    if (!s || s->volume < 0 || s->volume > 100) return;
 
-    if (!tm_value) {
-        dst[0] = '\0';
+    if (g_last_observed_volume == -1000) {
+        g_last_observed_volume = s->volume;
         return;
     }
 
-    char weekday[32];
-    char month[32];
-
-    strftime(weekday, sizeof(weekday), "%A", tm_value);
-    strftime(month, sizeof(month), "%B", tm_value);
-
-    snprintf(dst, dst_sz, "%s, %s %d", weekday, month, tm_value->tm_mday);
-}
-
-static void set_cpu_temp_unit_from_string(const char *unit) {
-    if (!unit || !*unit) return;
-
-    char c = (char)toupper((unsigned char)unit[0]);
-    if (c == 'C' || c == 'F') {
-        g_cfg_cpu_temp_unit = c;
+    if (s->volume != g_last_observed_volume) {
+        g_volume_overlay_direction = (s->volume > g_last_observed_volume) ? 1 : -1;
+        g_volume_overlay_volume = s->volume;
+        g_volume_overlay_started_at = now;
+        g_last_observed_volume = s->volume;
     }
 }
 
-static void set_clock_type_from_string(const char *clock_type) {
-    if (!clock_type || !*clock_type) return;
-
-    char tmp[16];
-    snprintf(tmp, sizeof(tmp), "%s", clock_type);
-    trim_in_place(tmp);
-    lower_ascii(tmp);
-
-    if (strcmp(tmp, "24") == 0 || strcmp(tmp, "24h") == 0 || strcmp(tmp, "24-hour") == 0) {
-        g_cfg_clock_24h = true;
-    } else if (strcmp(tmp, "12") == 0 || strcmp(tmp, "12h") == 0 || strcmp(tmp, "12-hour") == 0) {
-        g_cfg_clock_24h = false;
-    }
+static bool volume_overlay_active(double now) {
+    return g_volume_overlay_started_at >= 0.0 &&
+           (now - g_volume_overlay_started_at) < (double)g_cfg.ui.volume_overlay_seconds &&
+           g_volume_overlay_volume >= 0;
 }
 
-static bool read_cpu_temp_c(double *out_c) {
-    if (!out_c) return false;
+static void draw_volume_overlay(double now, bool clock_mode) {
+    if (clock_mode || !volume_overlay_active(now)) return;
 
-    FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    if (!fp) return false;
+    double age = now - g_volume_overlay_started_at;
+    int alpha = (int)(255.0 * (1.0 - (age / (double)g_cfg.ui.volume_overlay_seconds)));
+    alpha = clampi(alpha, 0, 255);
+    if (alpha <= 0) return;
 
-    long raw = 0;
-    int ok = fscanf(fp, "%ld", &raw);
-    fclose(fp);
+    int vol = clampi(g_volume_overlay_volume, 0, 100);
+    int bar_w = sx(g_cfg.ui.volume_bar_width);
+    int bar_h = sy(g_cfg.ui.volume_bar_height);
+    if (bar_h > g_h - sy(40)) bar_h = g_h - sy(40);
+    int bar_x = g_w - sx(g_cfg.ui.volume_bar_right_margin);
+    int bar_y = (g_h - bar_h) / 2;
+    int fill_h = bar_h * vol / 100;
+    int fill_y = bar_y + bar_h - fill_h;
 
-    if (ok != 1 || raw <= 0) return false;
+    /* Right-side vertical volume indicator. White only. */
+    fill_rect_alpha(bar_x - sx(5), bar_y - sy(8), bar_w + sx(10), bar_h + sy(16), g_cfg.ui.color_background, (alpha * 120) / 255);
+    fill_rect_alpha(bar_x, bar_y, bar_w, bar_h, g_cfg.ui.color_volume_bar, (alpha * 42) / 255);
+    fill_rect_alpha(bar_x, fill_y, bar_w, fill_h, g_cfg.ui.color_volume_bar, alpha);
 
-    *out_c = (raw > 1000) ? ((double)raw / 1000.0) : (double)raw;
-    return true;
+    /* Small direction and value hints, kept beside the right-edge bar. */
+    const char *dir = g_volume_overlay_direction > 0 ? "+" : "-";
+    int dir_w = text_width(g_font_bold, sf(18), dir);
+    draw_text_clip(g_font_bold, sf(18), bar_x - sx(3) + (bar_w - dir_w) / 2, bar_y - sy(14), dir, g_cfg.ui.color_text_main, alpha,
+                   bar_x - sx(20), 0, g_w, g_h);
+
+    char label[16];
+    snprintf(label, sizeof(label), "%d", vol);
+    int lw = text_width(g_font_bold, sf(14), label);
+    draw_text_clip(g_font_bold, sf(14), bar_x - sx(3) + (bar_w - lw) / 2, bar_y + bar_h + sy(20), label, g_cfg.ui.color_text_main, alpha,
+                   bar_x - sx(28), 0, g_w, g_h);
 }
 
-static bool format_cpu_temp_text(char *dst, size_t dst_sz) {
-    if (!dst || dst_sz == 0) return false;
+static void draw_truth_footer(const PlayerState *s, const AudioInfo *a, bool clock_mode, double now) {
+    int h = sy(g_cfg.ui.footer_height);
+    int y = g_h - h;
+    int px = sf(g_cfg.ui.footer_font_size);
+    int by = y + sy(16);
 
-    double temp_c = 0.0;
-    if (!read_cpu_temp_c(&temp_c)) {
-        snprintf(dst, dst_sz, "CPU: N/A");
-        return false;
+    char left[96];
+    char mid[64];
+    char right[96];
+
+    format_source_truth(s, left, sizeof(left));
+    if (clock_mode) mid[0] = '\0';
+    else format_clock_countdown(now, mid, sizeof(mid));
+    compact_audio_format(a, right, sizeof(right));
+
+    fill_rect(0, y, g_w, h, g_cfg.ui.color_panel);
+    fill_rect(0, y, g_w, 1, g_cfg.ui.color_panel_line);
+
+    draw_text_clip(g_font_reg, px, sx(8), by, left, g_cfg.ui.color_text_dim, 255, sx(6), y, g_w / 2 - sx(4), g_h);
+
+    if (mid[0]) {
+        int mw = text_width(g_font_reg, px, mid);
+        draw_text_clip(g_font_reg, px, g_w / 2 - mw / 2, by, mid, g_cfg.ui.color_text_muted, 255, g_w / 3, y, (2 * g_w) / 3, g_h);
     }
 
-    if (g_cfg_cpu_temp_unit == 'F') {
-        double temp_f = (temp_c * 9.0 / 5.0) + 32.0;
-        snprintf(dst, dst_sz, "CPU: %.0fF", temp_f);
-    } else {
-        snprintf(dst, dst_sz, "CPU: %.0fC", temp_c);
-    }
-
-    return temp_c > 80.0;
+    int rw = text_width(g_font_reg, px, right);
+    draw_text_clip(g_font_reg, px, g_w - sx(8) - rw, by, right, g_cfg.ui.color_text_muted, 255, g_w / 2, y, g_w - sx(6), g_h);
 }
 
-// ---------------- Config ----------------
-
-static bool write_all_fd(int fd, const char *data, size_t len) {
-    size_t written = 0;
-
-    while (written < len) {
-        ssize_t n = write(fd, data + written, len - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        written += (size_t)n;
-    }
-
-    return true;
+static void draw_progress(int x, int y, int w, int h, double seek, double dur) {
+    fill_rect(x, y, w, h, g_cfg.ui.color_progress_bg);
+    if (dur > 0.1) fill_rect(x, y, clampi((int)(w * seek / dur), 0, w), h, g_cfg.ui.color_progress_fg);
 }
 
-static bool create_default_json_config(void) {
-    json_object *root = json_object_new_object();
-    json_object *display = json_object_new_object();
-    json_object *volumio = json_object_new_object();
-    json_object *debug = json_object_new_object();
-
-    if (!root || !display || !volumio || !debug) {
-        if (root) json_object_put(root);
-        if (display) json_object_put(display);
-        if (volumio) json_object_put(volumio);
-        if (debug) json_object_put(debug);
-        return false;
-    }
-
-    json_object_object_add(display, "fb_path", json_object_new_string(g_cfg_fb_path));
-    json_object_object_add(display, "width", json_object_new_int(g_cfg_width));
-    json_object_object_add(display, "height", json_object_new_int(g_cfg_height));
-    json_object_object_add(display, "clock_type", json_object_new_string(g_cfg_clock_24h ? "24h" : "12h"));
-
-    char temp_unit[2] = { g_cfg_cpu_temp_unit, '\0' };
-    json_object_object_add(display, "cpu_temp_unit", json_object_new_string(temp_unit));
-
-    json_object_object_add(volumio, "wait_timeout_seconds", json_object_new_double(g_cfg_wait_timeout_seconds));
-    json_object_object_add(volumio, "album_art_delay_seconds", json_object_new_double(g_cfg_album_art_lookup_delay_seconds));
-    json_object_object_add(volumio, "album_art_recheck_seconds", json_object_new_double(g_cfg_album_art_recheck_seconds));
-
-    json_object_object_add(debug, "enabled", json_object_new_boolean(g_cfg_debug_enabled));
-    json_object_object_add(debug, "log_path", json_object_new_string(g_cfg_debug_log_path));
-    json_object_object_add(debug, "max_bytes", json_object_new_int64(g_cfg_debug_log_max_bytes));
-
-    json_object_object_add(root, "display", display);
-    json_object_object_add(root, "volumio", volumio);
-    json_object_object_add(root, "debug", debug);
-
-    const char *json_text = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
-    size_t json_len = strlen(json_text);
-
-    int fd = open(CONFIG_PATH, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        if (errno != EEXIST) {
-            fprintf(stderr, "[Config Warning] Could not create %s: %s\n", CONFIG_PATH, strerror(errno));
-        }
-        json_object_put(root);
-        return false;
-    }
-
-    bool ok = write_all_fd(fd, json_text, json_len) && write_all_fd(fd, "\n", 1);
-    if (!ok) {
-        fprintf(stderr, "[Config Warning] Could not write %s: %s\n", CONFIG_PATH, strerror(errno));
-        close(fd);
-        unlink(CONFIG_PATH);
-        json_object_put(root);
-        return false;
-    }
-
-    close(fd);
-    json_object_put(root);
-
-    printf("[Config] Created default config at %s.\n", CONFIG_PATH);
-    return true;
+/*
+ * Intelligent text bounds.
+ *
+ * Text should be clipped to the real usable layout region, not to magic
+ * coordinates. The right edge preserves normal padding and also reserves a
+ * slim safety lane for the vertical volume overlay so long titles never draw
+ * under the right-side bar when volume changes.
+ */
+static int ui_text_right_edge(void) {
+    int p = sx(g_cfg.ui.padding);
+    int vol_lane = sx(g_cfg.ui.volume_bar_width + g_cfg.ui.volume_bar_right_margin + 14);
+    int reserve = max_i(p, vol_lane);
+    int right = g_w - reserve;
+    if (right < p + sx(24)) right = g_w - p;
+    return clampi(right, p + 1, g_w - p);
 }
 
-static void load_json_config(void) {
-    int fd = open(CONFIG_PATH, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ENOENT) {
-            create_default_json_config();
-            fd = open(CONFIG_PATH, O_RDONLY | O_CLOEXEC);
-        }
-
-        if (fd < 0) {
-            printf("[Config] No readable config at %s. Using built-in defaults.\n", CONFIG_PATH);
-            return;
-        }
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > 65536) {
-        close(fd);
-        return;
-    }
-
-    char *buf = malloc((size_t)st.st_size + 1);
-    if (!buf) {
-        close(fd);
-        return;
-    }
-
-    ssize_t got = read(fd, buf, (size_t)st.st_size);
-    close(fd);
-
-    if (got <= 0) {
-        free(buf);
-        return;
-    }
-
-    buf[got] = '\0';
-    json_object *root = json_tokener_parse(buf);
-    free(buf);
-
-    if (!root) return;
-
-    json_object *display_obj = NULL;
-    if (json_object_object_get_ex(root, "display", &display_obj) && display_obj) {
-        json_object *v = NULL;
-
-        if (json_object_object_get_ex(display_obj, "fb_path", &v) && v) {
-            const char *s = json_object_get_string(v);
-            if (s && *s) copy_config_string(g_cfg_fb_path, sizeof(g_cfg_fb_path), s);
-        }
-
-        if (json_object_object_get_ex(display_obj, "width", &v) && v) {
-            int w = json_object_get_int(v);
-            if (w > 0) g_cfg_width = w;
-        }
-
-        if (json_object_object_get_ex(display_obj, "height", &v) && v) {
-            int h = json_object_get_int(v);
-            if (h > 0) g_cfg_height = h;
-        }
-
-        if (json_object_object_get_ex(display_obj, "clock_type", &v) && v) {
-            set_clock_type_from_string(json_object_get_string(v));
-        }
-
-        if (json_object_object_get_ex(display_obj, "cpu_temp_unit", &v) && v) {
-            set_cpu_temp_unit_from_string(json_object_get_string(v));
-        }
-
-        if (json_object_object_get_ex(display_obj, "temperature_unit", &v) && v) {
-            set_cpu_temp_unit_from_string(json_object_get_string(v));
-        }
-
-        if (json_object_object_get_ex(display_obj, "volumio_wait_timeout_seconds", &v) && v) {
-            double timeout = json_object_get_double(v);
-            if (timeout >= 0.0) g_cfg_wait_timeout_seconds = timeout;
-        }
-
-        if (json_object_object_get_ex(display_obj, "no_metadata_timeout_seconds", &v) && v) {
-            double timeout = json_object_get_double(v);
-            if (timeout >= 0.0) g_cfg_wait_timeout_seconds = timeout;
-        }
-    }
-
-    json_object *volumio_obj = NULL;
-    if (json_object_object_get_ex(root, "volumio", &volumio_obj) && volumio_obj) {
-        json_object *v = NULL;
-
-        if (json_object_object_get_ex(volumio_obj, "wait_timeout_seconds", &v) && v) {
-            double timeout = json_object_get_double(v);
-            if (timeout >= 0.0) g_cfg_wait_timeout_seconds = timeout;
-        }
-
-        if (json_object_object_get_ex(volumio_obj, "no_metadata_timeout_seconds", &v) && v) {
-            double timeout = json_object_get_double(v);
-            if (timeout >= 0.0) g_cfg_wait_timeout_seconds = timeout;
-        }
-
-        if (json_object_object_get_ex(volumio_obj, "album_art_delay_seconds", &v) && v) {
-            double delay = json_object_get_double(v);
-            if (delay >= 0.0) g_cfg_album_art_lookup_delay_seconds = delay;
-        }
-
-        if (json_object_object_get_ex(volumio_obj, "album_art_lookup_delay_seconds", &v) && v) {
-            double delay = json_object_get_double(v);
-            if (delay >= 0.0) g_cfg_album_art_lookup_delay_seconds = delay;
-        }
-
-        if (json_object_object_get_ex(volumio_obj, "art_lookup_delay_seconds", &v) && v) {
-            double delay = json_object_get_double(v);
-            if (delay >= 0.0) g_cfg_album_art_lookup_delay_seconds = delay;
-        }
-
-        if (json_object_object_get_ex(volumio_obj, "album_art_recheck_seconds", &v) && v) {
-            double recheck = json_object_get_double(v);
-            if (recheck >= 0.25) g_cfg_album_art_recheck_seconds = recheck;
-        }
-
-        if (json_object_object_get_ex(volumio_obj, "art_recheck_seconds", &v) && v) {
-            double recheck = json_object_get_double(v);
-            if (recheck >= 0.25) g_cfg_album_art_recheck_seconds = recheck;
-        }
-    }
-
-    json_object *debug_obj = NULL;
-    if (json_object_object_get_ex(root, "debug", &debug_obj) && debug_obj) {
-        json_object *v = NULL;
-
-        if (json_object_object_get_ex(debug_obj, "enabled", &v) && v) {
-            g_cfg_debug_enabled = json_object_get_boolean(v);
-        }
-
-        if (json_object_object_get_ex(debug_obj, "log_path", &v) && v) {
-            const char *s = json_object_get_string(v);
-            if (s && *s) copy_config_string(g_cfg_debug_log_path, sizeof(g_cfg_debug_log_path), s);
-        }
-
-        if (json_object_object_get_ex(debug_obj, "max_bytes", &v) && v) {
-            long max_bytes = (long)json_object_get_int(v);
-            if (max_bytes >= 4096) g_cfg_debug_log_max_bytes = max_bytes;
-        }
-    }
-
-    json_object_put(root);
+static int ui_text_width_from(int x) {
+    int p = sx(g_cfg.ui.padding);
+    int left = clampi(x, p, max_i(p, g_w - p));
+    int right = ui_text_right_edge();
+    if (right <= left + sx(24)) right = g_w - p;
+    return max_i(1, right - left);
 }
 
-// ---------------- HTTP Keep-Alive ----------------
-
-static void close_http_keepalive(void) {
-    if (g_http_fd >= 0) {
-        close(g_http_fd);
-        g_http_fd = -1;
-    }
-}
-
-static void reset_http_buffer(void) {
-    free(g_http_buffer);
-    g_http_buffer = NULL;
-    g_http_buf_cap = 0;
-    g_http_buf_len = 0;
-}
-
-static bool set_socket_timeout(int fd, int seconds) {
-    struct timeval tv;
-    tv.tv_sec = seconds;
-    tv.tv_usec = 0;
-
-    bool ok = true;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) ok = false;
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) ok = false;
-    return ok;
-}
-
-static bool connect_http_keepalive(void) {
-    if (!g_running) return false;
-    if (g_http_fd >= 0) return true;
-
-    g_http_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (g_http_fd < 0) {
-        DBG_LOG("HTTP socket create failed: errno=%d", errno);
-        return false;
-    }
-
-    set_socket_timeout(g_http_fd, 2);
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(VOLUMIO_PORT);
-
-    if (inet_pton(AF_INET, VOLUMIO_HOST, &addr.sin_addr) != 1) {
-        DBG_LOG("HTTP inet_pton failed for host %s", VOLUMIO_HOST);
-        close_http_keepalive();
-        return false;
-    }
-
-    if (connect(g_http_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        DBG_LOG("HTTP connect failed to %s:%d errno=%d", VOLUMIO_HOST, VOLUMIO_PORT, errno);
-        close_http_keepalive();
-        return false;
-    }
-
-    DBG_LOG("HTTP keep-alive connected to %s:%d", VOLUMIO_HOST, VOLUMIO_PORT);
-    return true;
-}
-
-static bool send_all(int fd, const char *data, size_t len) {
-    if (fd < 0 || (!data && len > 0)) return false;
-    if (!g_running) return false;
-
-    size_t sent = 0;
-
-    while (sent < len && g_running) {
-        struct pollfd pfd;
-        memset(&pfd, 0, sizeof(pfd));
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-
-        // Explicit 1000ms write deadline per chunk so the display loop cannot hang here.
-        int ret = poll(&pfd, 1, 1000);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            close_http_keepalive();
-            return false;
-        }
-
-        if (ret == 0) {
-            close_http_keepalive();
-            return false;
-        }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            close_http_keepalive();
-            return false;
-        }
-        if (!(pfd.revents & POLLOUT)) continue;
-        if (!g_running) return false;
-
-        ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            close_http_keepalive();
-            return false;
-        }
-
-        if (n == 0) {
-            close_http_keepalive();
-            return false;
-        }
-        sent += (size_t)n;
-    }
-
-    return sent == len;
-}
-
-static uint8_t *find_header_end(uint8_t *data, size_t len) {
-    if (!data || len < 4) return NULL;
-
-    for (size_t i = 0; i + 3 < len; i++) {
-        if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
-            return data + i;
-        }
-    }
-
-    return NULL;
-}
-
-static bool header_has_token(uint8_t *headers, size_t header_len, const char *needle) {
-    if (!headers || !needle || header_len == 0) return false;
-
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0 || needle_len > header_len) return false;
-
-    // Bounded scan. Do not temporarily write a null terminator into the receive buffer.
-    for (size_t i = 0; i <= header_len - needle_len; i++) {
-        if (strncasecmp((const char *)(headers + i), needle, needle_len) == 0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static ssize_t header_content_length(uint8_t *headers, size_t header_len) {
-    if (!headers || header_len == 0) return -1;
-
-    const char *target = "Content-Length:";
-    size_t target_len = strlen(target);
-    if (target_len > header_len) return -1;
-
-    for (size_t i = 0; i <= header_len - target_len; i++) {
-        if (strncasecmp((const char *)(headers + i), target, target_len) != 0) continue;
-
-        uint8_t *p = headers + i + target_len;
-        uint8_t *end = headers + header_len;
-
-        while (p < end && isspace((unsigned char)*p)) p++;
-        if (p >= end || !isdigit((unsigned char)*p)) return -1;
-
-        unsigned long value = 0;
-        while (p < end && isdigit((unsigned char)*p)) {
-            unsigned digit = (unsigned)(*p - '0');
-            if (value > ((unsigned long)SSIZE_MAX - digit) / 10UL) return -1;
-            value = (value * 10UL) + digit;
-            p++;
-        }
-
-        return (ssize_t)value;
-    }
-
-    return -1;
-}
-
-static uint8_t *decode_chunked_body(const uint8_t *body, size_t body_len, size_t *out_len) {
-    const uint8_t *p = body;
-    const uint8_t *end = body + body_len;
-    uint8_t *out = malloc(body_len + 1);
-    if (!out) return NULL;
-
-    size_t used = 0;
-
-    while (p < end) {
-        const uint8_t *line_end = NULL;
-        for (const uint8_t *q = p; q + 1 < end; q++) {
-            if (q[0] == '\r' && q[1] == '\n') {
-                line_end = q;
-                break;
-            }
-        }
-
-        if (!line_end) {
-            free(out);
-            return NULL;
-        }
-
-        char line[64];
-        size_t line_len = (size_t)(line_end - p);
-        if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
-        memcpy(line, p, line_len);
-        line[line_len] = '\0';
-
-        char *semi = strchr(line, ';');
-        if (semi) *semi = '\0';
-
-        long chunk = strtol(line, NULL, 16);
-        if (chunk < 0) {
-            free(out);
-            return NULL;
-        }
-
-        p = line_end + 2;
-
-        if (chunk == 0) break;
-
-        if ((size_t)(end - p) < (size_t)chunk + 2) {
-            free(out);
-            return NULL;
-        }
-
-        memcpy(out + used, p, (size_t)chunk);
-        used += (size_t)chunk;
-        p += chunk;
-
-        if (p + 1 >= end || p[0] != '\r' || p[1] != '\n') {
-            free(out);
-            return NULL;
-        }
-
-        p += 2;
-    }
-
-    out[used] = '\0';
-
-    // Shrink the temporary chunk buffer before returning. The decoded body is
-    // never larger than the encoded chunked body, so this avoids keeping the
-    // oversized HTTP receive allocation around after decoding.
-    uint8_t *shrunk = realloc(out, used + 1);
-    if (shrunk) out = shrunk;
-
-    if (out_len) *out_len = used;
-    return out;
-}
-
-static uint8_t *http_get_once(const char *path, const char *accept_header, size_t *out_len) {
-    if (out_len) *out_len = 0;
-    if (!g_running) return NULL;
-
-    if (!connect_http_keepalive()) return NULL;
-
-    char req[1024];
-    snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\n"
-             "Host: %s:%d\r\n"
-             "Accept: %s\r\n"
-             "Connection: keep-alive\r\n"
-             "User-Agent: volumio_fbd/merged-compat\r\n"
-             "\r\n",
-             path, VOLUMIO_HOST, VOLUMIO_PORT, accept_header ? accept_header : "*/*");
-
-    if (!send_all(g_http_fd, req, strlen(req))) {
-        DBG_LOG("HTTP send failed for path %s errno=%d", path ? path : "(null)", errno);
-        close_http_keepalive();
-        return NULL;
-    }
-    if (!g_running) return NULL;
-
-    g_http_buf_len = 0;
-    if (!g_http_buffer) {
-        g_http_buf_cap = HTTP_BUFFER_INITIAL;
-        g_http_buffer = malloc(g_http_buf_cap);
-        if (!g_http_buffer) {
-            close_http_keepalive();
-            return NULL;
-        }
-    }
-
-    size_t header_len = 0;
-    size_t body_start = 0;
-    bool header_seen = false;
-    bool is_chunked = false;
-    ssize_t content_len = -1;
-
-    while (g_running) {
-        if (g_http_buf_len + 4096 + 1 > g_http_buf_cap) {
-            size_t new_cap = g_http_buf_cap ? g_http_buf_cap * 2 : HTTP_BUFFER_INITIAL;
-
-            if (new_cap < g_http_buf_cap || new_cap > HTTP_BUFFER_MAX) {
-                DBG_LOG("HTTP buffer limit reached for path %s cap=%zu", path ? path : "(null)", g_http_buf_cap);
-                reset_http_buffer();
-                close_http_keepalive();
-                return NULL;
-            }
-
-            uint8_t *new_buf = realloc(g_http_buffer, new_cap);
-            if (!new_buf) {
-                DBG_LOG("HTTP buffer realloc failed for path %s requested=%zu", path ? path : "(null)", new_cap);
-                reset_http_buffer();
-                close_http_keepalive();
-                return NULL;
-            }
-
-            g_http_buffer = new_buf;
-            g_http_buf_cap = new_cap;
-        }
-
-        ssize_t n = recv(g_http_fd, g_http_buffer + g_http_buf_len, g_http_buf_cap - g_http_buf_len - 1, 0);
-        if (n <= 0) {
-            DBG_LOG("HTTP recv failed/closed for path %s n=%zd errno=%d", path ? path : "(null)", n, errno);
-            close_http_keepalive();
-            return NULL;
-        }
-
-        g_http_buf_len += (size_t)n;
-        g_http_buffer[g_http_buf_len] = '\0';
-
-        if (!header_seen) {
-            uint8_t *he = find_header_end(g_http_buffer, g_http_buf_len);
-            if (!he) continue;
-
-            header_len = (size_t)(he - g_http_buffer);
-            body_start = header_len + 4;
-            header_seen = true;
-
-            int status_code = 0;
-            sscanf((char *)g_http_buffer, "HTTP/%*s %d", &status_code);
-            if (status_code < 200 || status_code >= 300) {
-                DBG_LOG("HTTP non-success status %d for path %s", status_code, path ? path : "(null)");
-                close_http_keepalive();
-                return NULL;
-            }
-
-            is_chunked = header_has_token(g_http_buffer, header_len, "Transfer-Encoding: chunked");
-            content_len = header_content_length(g_http_buffer, header_len);
-        }
-
-        if (!header_seen) continue;
-
-        size_t have_body = g_http_buf_len - body_start;
-
-        if (!is_chunked && content_len >= 0 && have_body >= (size_t)content_len) {
-            uint8_t *body = malloc((size_t)content_len + 1);
-            if (!body) return NULL;
-
-            memcpy(body, g_http_buffer + body_start, (size_t)content_len);
-            body[content_len] = '\0';
-            if (out_len) *out_len = (size_t)content_len;
-            return body;
-        }
-
-        if (is_chunked) {
-            size_t decoded_len = 0;
-            uint8_t *decoded = decode_chunked_body(g_http_buffer + body_start, have_body, &decoded_len);
-            if (decoded) {
-                if (out_len) *out_len = decoded_len;
-                return decoded;
-            }
-        }
-    }
-
-    return NULL;
-}
-
-static uint8_t *http_get_localhost_body_keepalive(const char *path, const char *accept_header, size_t *out_len) {
-    if (!g_running) return NULL;
-
-    uint8_t *body = http_get_once(path, accept_header, out_len);
-    if (body) return body;
-    if (!g_running) return NULL;
-
-    close_http_keepalive();
-    if (!g_running) return NULL;
-
-    return http_get_once(path, accept_header, out_len);
-}
-
-typedef struct {
-    uint8_t *data;
-    size_t len;
-    size_t cap;
-} CurlMemoryBuffer;
-
-static size_t curl_write_memory_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
-    CurlMemoryBuffer *buf = (CurlMemoryBuffer *)userdata;
-    size_t add = size * nmemb;
-
-    if (!buf || !ptr || add == 0) return 0;
-
-    if (buf->len + add + 1 > HTTP_BUFFER_MAX) {
-        return 0;
-    }
-
-    if (buf->len + add + 1 > buf->cap) {
-        size_t new_cap = buf->cap ? buf->cap : HTTP_BUFFER_INITIAL;
-
-        while (new_cap < buf->len + add + 1) {
-            if (new_cap > HTTP_BUFFER_MAX / 2) {
-                new_cap = HTTP_BUFFER_MAX;
-                break;
-            }
-            new_cap *= 2;
-        }
-
-        if (new_cap < buf->len + add + 1 || new_cap > HTTP_BUFFER_MAX) {
-            return 0;
-        }
-
-        uint8_t *new_data = realloc(buf->data, new_cap);
-        if (!new_data) return 0;
-
-        buf->data = new_data;
-        buf->cap = new_cap;
-    }
-
-    memcpy(buf->data + buf->len, ptr, add);
-    buf->len += add;
-    buf->data[buf->len] = '\0';
-
-    return add;
-}
-
-static uint8_t *http_get_remote_body_curl(const char *url, size_t *out_len) {
-    if (out_len) *out_len = 0;
-    if (!url || !*url || !g_running) return NULL;
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        DBG_LOG("Remote artwork curl init failed: url=%s", url);
-        return NULL;
-    }
-
-    CurlMemoryBuffer buf;
-    memset(&buf, 0, sizeof(buf));
-
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_memory_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "volumio_fbd/" VOLUMIO_FBD_BUILD_ID);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2500L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-
-    CURLcode rc = curl_easy_perform(curl);
-    long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_cleanup(curl);
-
-    if (rc != CURLE_OK || response_code < 200 || response_code >= 300 || buf.len == 0) {
-        DBG_LOG("Remote artwork curl fetch failed: url=%s rc=%d http=%ld bytes=%zu",
-                url, (int)rc, response_code, buf.len);
-        free(buf.data);
-        return NULL;
-    }
-
-    if (out_len) *out_len = buf.len;
-
-    DBG_LOG("Remote artwork curl fetch ok: url=%s http=%ld bytes=%zu",
-            url, response_code, buf.len);
-
-    return buf.data;
-}
-
-// ---------------- Volumio ----------------
-
-static bool albumart_source_is_remote_url(const char *src) {
-    if (!src) return false;
-    return strncmp(src, "http://", 7) == 0 || strncmp(src, "https://", 8) == 0;
-}
-
-static bool build_local_albumart_path(char *dst, size_t dst_sz, const char *src) {
-    if (!dst || dst_sz == 0) return false;
-    dst[0] = '\0';
-
-    if (!src || !*src) return false;
-
-    if (strncmp(src, "http://127.0.0.1:3000", 21) == 0 ||
-        strncmp(src, "http://localhost:3000", 21) == 0) {
-        snprintf(dst, dst_sz, "%s", src + 21);
-        return dst[0] != '\0';
-    }
-
-    if (albumart_source_is_remote_url(src)) {
-        return false;
-    }
-
-    snprintf(dst, dst_sz, "%s%s", src[0] == '/' ? "" : "/", src);
-    return dst[0] != '\0';
-}
-
-static void activate_pulse_album_art_fallback(const char *track_key, const char *reason) {
-    if (!track_key || !*track_key) return;
-
-    if (g_art_is_default_fallback &&
-        g_art_is_pulse_fallback &&
-        !g_art_rgba &&
-        strcmp(track_key, g_art_loaded_track_key) == 0) {
-        return;
-    }
-
-    clear_album_art_pixels();
-
-    snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "__pulse_default_fallback__|%s", track_key);
-    snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
-    g_art_is_default_fallback = true;
-    g_art_is_pulse_fallback = true;
-    mark_album_art_changed("pulse fallback loaded");
-
-    DBG_LOG("Pulse default album art fallback loaded: reason=%s track='%s' generation=%lu",
-            reason ? reason : "unknown", track_key, g_art_generation);
-}
-
-static void load_default_album_art_fallback(const char *track_key, const char *reason, bool allow_volumio_http) {
-    if (!track_key || !*track_key) return;
-
-    if (!allow_volumio_http) {
-        activate_pulse_album_art_fallback(track_key, reason);
-        return;
-    }
-
-    if (g_art_is_default_fallback &&
-        !g_art_is_pulse_fallback &&
-        g_art_rgba &&
-        strcmp(track_key, g_art_loaded_track_key) == 0 &&
-        strncmp(g_art_loaded_url, "__volumio_default_fallback__", 28) == 0) {
-        return;
-    }
-
-    close_http_keepalive();
-
-    size_t img_len = 0;
-    uint8_t *img_data = http_get_localhost_body_keepalive("/albumart", "image/*", &img_len);
-
-    if (img_data && img_len > 0) {
-        int art_w = 0;
-        int art_h = 0;
-        int comp = 0;
-        uint8_t *fallback_art = stbi_load_from_memory(img_data, (int)img_len, &art_w, &art_h, &comp, 4);
-        free(img_data);
-
-        if (fallback_art && art_w > 0 && art_h > 0) {
-            clear_album_art_pixels();
-
-            g_art_rgba = fallback_art;
-            g_art_w = art_w;
-            g_art_h = art_h;
-            snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "__volumio_default_fallback__|%s", track_key);
-            snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
-            g_art_is_default_fallback = true;
-            g_art_is_pulse_fallback = false;
-            mark_album_art_changed("volumio fallback loaded");
-
-            DBG_LOG("Volumio default album art fallback loaded: reason=%s bytes=%zu size=%dx%d track='%s' generation=%lu",
-                    reason ? reason : "unknown", img_len, g_art_w, g_art_h, track_key, g_art_generation);
-            return;
-        }
-
-        if (fallback_art) stbi_image_free(fallback_art);
-        DBG_LOG("Volumio default album art fallback decode failed: reason=%s bytes=%zu track='%s'",
-                reason ? reason : "unknown", img_len, track_key);
-    } else {
-        free(img_data);
-        DBG_LOG("Volumio default album art fallback unavailable: reason=%s track='%s'",
-                reason ? reason : "unknown", track_key);
-    }
-
-    activate_pulse_album_art_fallback(track_key, reason);
-}
-
-static bool album_art_track_stable_for_lookup(const char *track_key, double now) {
-    if (!track_key || !*track_key) return false;
-
-    if (strcmp(track_key, g_art_lookup_track_key) != 0) {
-        snprintf(g_art_lookup_track_key, sizeof(g_art_lookup_track_key), "%s", track_key);
-        g_art_lookup_track_since = now;
-        g_art_last_check_at = -1.0;
-
-        DBG_LOG("Album art lookup delayed: track='%s' delay=%.2f", track_key, g_cfg_album_art_lookup_delay_seconds);
-        return g_cfg_album_art_lookup_delay_seconds <= 0.0;
-    }
-
-    if (g_art_lookup_track_since < 0.0) {
-        g_art_lookup_track_since = now;
-        return g_cfg_album_art_lookup_delay_seconds <= 0.0;
-    }
-
-    return (now - g_art_lookup_track_since) >= g_cfg_album_art_lookup_delay_seconds;
-}
-
-static void update_album_art_if_needed(void) {
-    char track_key[1024];
-    build_current_track_key(track_key, sizeof(track_key));
-    double now = monotonic_seconds();
-
-    if (!source_state_shows_metadata() || !current_track_has_identity()) {
-        if (g_art_rgba) {
-            DBG_LOG("Album art cleared: state=%s title='%s' albumart='%s'",
-                    g_status_state, g_status_title, g_status_albumart);
-        }
-
-        clear_album_art_pixels();
-        reset_album_art_lookup_timing();
-        return;
-    }
-
-    if (strcmp(track_key, g_art_lookup_track_key) != 0) {
-        DBG_LOG("Album art track changed: old='%s' new='%s' albumart='%s'",
-                g_art_lookup_track_key, track_key, g_status_albumart);
-        clear_album_art_pixels();
-        g_art_last_check_at = -1.0;
-    }
-
-    // Display-only fallback. It prevents blank art, but it never stops the real
-    // lookup timer or retry loop.
-    if (!g_art_rgba) {
-        load_default_album_art_fallback(track_key, "waiting for stable artwork lookup", false);
-    }
-
-    // Fast skipping protection: do not touch artwork endpoints until the same
-    // track identity has remained stable for the configured delay.
-    if (!album_art_track_stable_for_lookup(track_key, now)) {
-        return;
-    }
-
-    if (!albumart_source_is_specific(g_status_albumart)) {
-        if (g_art_last_check_at < 0.0 || now - g_art_last_check_at >= g_cfg_album_art_recheck_seconds) {
-            g_art_last_check_at = now;
-            DBG_LOG("Album art source not specific yet: raw='%s' track='%s' recheck=%.2f",
-                    g_status_albumart, track_key, g_cfg_album_art_recheck_seconds);
-        }
-        return;
-    }
-
-    char art_cache_key[1536];
-    snprintf(art_cache_key, sizeof(art_cache_key), "%s|%s", g_status_albumart, track_key);
-
-    if (!g_art_is_default_fallback &&
-        strcmp(art_cache_key, g_art_loaded_url) == 0 &&
-        strcmp(track_key, g_art_loaded_track_key) == 0 &&
-        g_art_rgba) {
-        return;
-    }
-
-    if (g_art_last_check_at >= 0.0 &&
-        now - g_art_last_check_at < g_cfg_album_art_recheck_seconds) {
-        return;
-    }
-
-    g_art_last_check_at = now;
-
-    size_t img_len = 0;
-    uint8_t *img_data = NULL;
-    char art_path[2048];
-    const char *decode_label = g_status_albumart;
-    bool used_remote_direct = false;
-
-    if (albumart_source_is_remote_url(g_status_albumart) &&
-        strncmp(g_status_albumart, "http://127.0.0.1:3000", 21) != 0 &&
-        strncmp(g_status_albumart, "http://localhost:3000", 21) != 0) {
-        used_remote_direct = true;
-        DBG_LOG("Album art fetch direct remote: url=%s track='%s'",
-                g_status_albumart, track_key);
-        img_data = http_get_remote_body_curl(g_status_albumart, &img_len);
-    } else if (build_local_albumart_path(art_path, sizeof(art_path), g_status_albumart)) {
-        decode_label = art_path;
-        DBG_LOG("Album art fetch local: path=%s track='%s'",
-                art_path, track_key);
-        close_http_keepalive();
-        img_data = http_get_localhost_body_keepalive(art_path, "image/*", &img_len);
-    } else {
-        DBG_LOG("Album art path unsupported: raw='%s' track='%s'", g_status_albumart, track_key);
-    }
-
-    if (!img_data || img_len == 0) {
-        DBG_LOG("Album art download failed: source=%s track='%s' remote=%s",
-                decode_label ? decode_label : "(null)", track_key, used_remote_direct ? "true" : "false");
-        free(img_data);
-        g_art_loaded_url[0] = '\0';
-        load_default_album_art_fallback(track_key, "specific artwork unavailable", true);
-        return;
-    }
-
-    int art_w = 0;
-    int art_h = 0;
-    int comp = 0;
-    uint8_t *new_art = stbi_load_from_memory(img_data, (int)img_len, &art_w, &art_h, &comp, 4);
-    free(img_data);
-
-    if (!new_art || art_w <= 0 || art_h <= 0) {
-        if (new_art) stbi_image_free(new_art);
-        DBG_LOG("Album art decode failed: source=%s bytes=%zu track='%s'",
-                decode_label ? decode_label : "(null)", img_len, track_key);
-        g_art_loaded_url[0] = '\0';
-        load_default_album_art_fallback(track_key, "specific artwork decode failed", true);
-        return;
-    }
-
-    clear_album_art_pixels();
-
-    g_art_rgba = new_art;
-    g_art_w = art_w;
-    g_art_h = art_h;
-    snprintf(g_art_loaded_url, sizeof(g_art_loaded_url), "%s", art_cache_key);
-    snprintf(g_art_loaded_track_key, sizeof(g_art_loaded_track_key), "%s", track_key);
-    g_art_is_default_fallback = false;
-    g_art_is_pulse_fallback = false;
-    mark_album_art_changed("real art loaded");
-    g_art_last_check_at = -1.0;
-
-    DBG_LOG("Album art loaded: source=%s bytes=%zu size=%dx%d track='%s' generation=%lu remote=%s",
-            decode_label ? decode_label : "(null)", img_len, g_art_w, g_art_h,
-            track_key, g_art_generation, used_remote_direct ? "true" : "false");
-}
-
-
-static bool json_value_to_volume_int(json_object *obj, int *out_volume) {
-    if (!obj || !out_volume) return false;
-
-    json_type type = json_object_get_type(obj);
-
-    if (type == json_type_int || type == json_type_double) {
-        int v = (int)round(json_object_get_double(obj));
-        *out_volume = clamp_int(v, 0, 100);
-        return true;
-    }
-
-    if (type == json_type_string) {
-        const char *s = json_object_get_string(obj);
-        if (!s) return false;
-
-        while (*s && isspace((unsigned char)*s)) s++;
-        if (!*s) return false;
-
-        char *end = NULL;
-        errno = 0;
-        long v = strtol(s, &end, 10);
-        if (errno != 0 || end == s) return false;
-
-        *out_volume = clamp_int((int)v, 0, 100);
-        return true;
-    }
-
-    if (type == json_type_object) {
-        static const char *keys[] = { "value", "current", "volume", "vol" };
-        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-            json_object *child = NULL;
-            if (json_object_object_get_ex(obj, keys[i], &child) && child) {
-                if (json_value_to_volume_int(child, out_volume)) return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-static bool json_key_suggests_volume(const char *key) {
-    if (!key || !*key) return false;
-
-    char tmp[128];
-    lower_trimmed_copy(tmp, sizeof(tmp), key);
-
-    return strcmp(tmp, "volume") == 0 ||
-           strcmp(tmp, "vol") == 0 ||
-           string_ends_with(tmp, "volume") ||
-           string_ends_with(tmp, "_vol") ||
-           string_ends_with(tmp, "-vol");
-}
-
-static bool extract_volume_recursive(json_object *obj, int *out_volume, int depth) {
-    if (!obj || !out_volume || depth > 3) return false;
-
-    json_type type = json_object_get_type(obj);
-
-    if (type == json_type_object) {
-        {
-            json_object_object_foreach(obj, key, val) {
-                if (json_key_suggests_volume(key) && json_value_to_volume_int(val, out_volume)) {
-                    return true;
-                }
-            }
-        }
-
-        {
-            json_object_object_foreach(obj, key, val) {
-                (void)key;
-                if (extract_volume_recursive(val, out_volume, depth + 1)) return true;
-            }
-        }
-    } else if (type == json_type_array) {
-        int n = json_object_array_length(obj);
-        for (int i = 0; i < n; i++) {
-            if (extract_volume_recursive(json_object_array_get_idx(obj, i), out_volume, depth + 1)) return true;
-        }
-    }
-
-    return false;
-}
-
-static bool extract_volume_from_state(json_object *root, int *out_volume) {
-    return extract_volume_recursive(root, out_volume, 0);
-}
-
-static void note_volume_state(int new_volume, double now) {
-    new_volume = clamp_int(new_volume, 0, 100);
-
-    if (!g_status_volume_seen) {
-        g_status_volume = new_volume;
-        g_status_volume_seen = true;
-        DBG_LOG("Volumio volume initialized: volume=%d", g_status_volume);
-        return;
-    }
-
-    if (new_volume == g_status_volume) return;
-
-    int old_volume = g_status_volume;
-    g_volume_overlay_start_volume = old_volume;
-    g_status_volume = new_volume;
-    g_volume_overlay_direction = (new_volume > old_volume) ? 1 : -1;
-    g_volume_overlay_last_change_at = now;
-
-    DBG_LOG("Volumio volume changed: old=%d new=%d direction=%s overlay_timeout=%.2f",
-            old_volume, new_volume,
-            g_volume_overlay_direction > 0 ? "up" : "down",
-            g_cfg_wait_timeout_seconds * 0.5);
-}
-
-static void update_volumio_state(void) {
-    double now = monotonic_seconds();
-    static double s_last_http_fetch = 0.0;
-
-    if (now - s_last_http_fetch < 0.5) return;
-    s_last_http_fetch = now;
-
-    size_t len = 0;
-    uint8_t *body = http_get_localhost_body_keepalive(VOLUMIO_PATH, "application/json", &len);
-    if (!body) {
-        DBG_LOG("Volumio state fetch failed");
-
-        if (g_cfg_wait_timeout_seconds > 0.0 && source_state_shows_metadata() && !state_has_track_payload()) {
-            if (g_status_fetch_failed_started_at < 0.0) {
-                g_status_fetch_failed_started_at = now;
-            }
-
-            if (now - g_status_fetch_failed_started_at >= g_cfg_wait_timeout_seconds) {
-                force_large_clock_state("volumio fetch timeout with no metadata");
-            }
-        }
-
-        return;
-    }
-
-    g_status_fetch_failed_started_at = -1.0;
-
-    json_object *root = json_tokener_parse((char *)body);
-    free(body);
-
-    if (!root) {
-        DBG_LOG("Volumio JSON parse failed, bytes=%zu", len);
-        return;
-    }
-
-    char old_state[sizeof(g_status_state)];
-    char old_title[sizeof(g_status_title)];
-    char old_artist[sizeof(g_status_artist)];
-
-    snprintf(old_state, sizeof(old_state), "%s", g_status_state);
-    snprintf(old_title, sizeof(old_title), "%s", g_status_title);
-    snprintf(old_artist, sizeof(old_artist), "%s", g_status_artist);
-
-    json_object *val = NULL;
-
-    if (json_object_object_get_ex(root, "status", &val)) {
-        normalize_state(g_status_state, sizeof(g_status_state), json_object_get_string(val));
-    }
-
-    copy_json_string(g_status_title, sizeof(g_status_title), root, "title", "");
-    copy_json_string(g_status_artist, sizeof(g_status_artist), root, "artist", "");
-    copy_json_string(g_status_album, sizeof(g_status_album), root, "album", "");
-    copy_json_string(g_status_albumart, sizeof(g_status_albumart), root, "albumart", "");
-    copy_json_string(g_status_track_type, sizeof(g_status_track_type), root, "trackType", "");
-    copy_json_string(g_status_samplerate, sizeof(g_status_samplerate), root, "samplerate", "");
-    copy_json_string(g_status_bitdepth, sizeof(g_status_bitdepth), root, "bitdepth", "");
-
-    if (json_object_object_get_ex(root, "seek", &val)) {
-        int seek_ms = json_object_get_int(val);
-        g_status_seek = seek_ms / 1000;
-    }
-
-    if (json_object_object_get_ex(root, "duration", &val)) {
-        g_status_duration = json_object_get_int(val);
-    }
-
-    int parsed_volume = 0;
-    if (extract_volume_from_state(root, &parsed_volume)) {
-        note_volume_state(parsed_volume, now);
-    }
-
-    g_status_last_updated = monotonic_seconds();
-    json_object_put(root);
-
-    suppress_metadata_less_playback_if_latched(now);
-
-    if (strcmp(old_state, g_status_state) != 0 ||
-        strcmp(old_title, g_status_title) != 0 ||
-        strcmp(old_artist, g_status_artist) != 0) {
-        DBG_LOG("Volumio state: state=%s title='%s' artist='%s' album='%s' seek=%d duration=%d volume=%d trackType='%s' samplerate='%s' bitdepth='%s' albumart='%s'",
-                g_status_state, g_status_title, g_status_artist, g_status_album,
-                g_status_seek, g_status_duration, g_status_volume, g_status_track_type, g_status_samplerate,
-                g_status_bitdepth, g_status_albumart);
-    }
-
-    apply_wait_timeout(now);
-    update_album_art_if_needed();
-}
-
-// ---------------- Drawing ----------------
-
-static void draw_fill_rect(int x, int y, int w, int h, uint32_t color) {
-    if (!g_img || w <= 0 || h <= 0) return;
-
-    int x0 = clamp_int(x, 0, g_width);
-    int y0 = clamp_int(y, 0, g_height);
-    int x1 = clamp_int(x + w, 0, g_width);
-    int y1 = clamp_int(y + h, 0, g_height);
-
-    if (x1 <= x0 || y1 <= y0) return;
-
-    uint8_t r = (uint8_t)((color >> 16) & 0xFF);
-    uint8_t g = (uint8_t)((color >> 8) & 0xFF);
-    uint8_t b = (uint8_t)(color & 0xFF);
-
-    for (int cy = y0; cy < y1; cy++) {
-        uint8_t *row_ptr = g_img + ((size_t)cy * (size_t)g_width + (size_t)x0) * 3;
-        for (int cx = x0; cx < x1; cx++) {
-            *row_ptr++ = r;
-            *row_ptr++ = g;
-            *row_ptr++ = b;
-        }
-    }
-}
-
-static int current_face_pixel_size(FT_Face face) {
-    if (!face || !face->size) return 0;
-    int y_ppem = (int)face->size->metrics.y_ppem;
-    return y_ppem > 0 ? y_ppem : 0;
-}
-
-static void free_glyph_entry(GlyphCacheEntry *g) {
-    if (!g) return;
-    free(g->alpha);
-    memset(g, 0, sizeof(*g));
-}
-
-static void free_font_atlases(void) {
-    for (size_t a = 0; a < g_glyph_atlas_count; a++) {
-        for (int slot = 0; slot < GLYPH_CACHE_SLOTS; slot++) {
-            free_glyph_entry(&g_glyph_atlases[a].glyphs[slot]);
-        }
-        memset(&g_glyph_atlases[a], 0, sizeof(g_glyph_atlases[a]));
-    }
-    g_glyph_atlas_count = 0;
-}
-
-static GlyphAtlas *get_font_atlas(FT_Face face, int pixel_size, bool create) {
-    if (!face || pixel_size <= 0) return NULL;
-
-    for (size_t i = 0; i < g_glyph_atlas_count; i++) {
-        if (g_glyph_atlases[i].used &&
-            g_glyph_atlases[i].face == face &&
-            g_glyph_atlases[i].pixel_size == pixel_size) {
-            return &g_glyph_atlases[i];
-        }
-    }
-
-    if (!create || g_glyph_atlas_count >= GLYPH_ATLAS_MAX) return NULL;
-
-    GlyphAtlas *atlas = &g_glyph_atlases[g_glyph_atlas_count++];
-    memset(atlas, 0, sizeof(*atlas));
-    atlas->used = true;
-    atlas->face = face;
-    atlas->pixel_size = pixel_size;
-    return atlas;
-}
-
-static uint32_t glyph_hash_codepoint(uint32_t codepoint) {
-    codepoint ^= codepoint >> 16;
-    codepoint *= 0x7feb352dU;
-    codepoint ^= codepoint >> 15;
-    codepoint *= 0x846ca68bU;
-    codepoint ^= codepoint >> 16;
-    return codepoint;
-}
-
-static GlyphCacheEntry *cache_glyph(GlyphAtlas *atlas, uint32_t codepoint) {
-    if (!atlas) return NULL;
-    if (codepoint == 0) codepoint = '?';
-
-    size_t slot = (size_t)(glyph_hash_codepoint(codepoint) & (GLYPH_CACHE_SLOTS - 1));
-    GlyphCacheEntry *entry = NULL;
-
-    for (size_t probe = 0; probe < GLYPH_CACHE_SLOTS; probe++) {
-        entry = &atlas->glyphs[(slot + probe) & (GLYPH_CACHE_SLOTS - 1)];
-
-        if (entry->valid && entry->codepoint == codepoint) {
-            return entry;
-        }
-
-        if (!entry->valid) {
-            break;
-        }
-    }
-
-    if (!entry) return NULL;
-
-    // Cache full. Evict the hashed slot. This keeps memory fixed and avoids
-    // heap growth on long titles with many unique Unicode characters.
-    if (entry->valid) {
-        free_glyph_entry(entry);
-    }
-
-    entry->codepoint = codepoint;
-    FT_Set_Pixel_Sizes(atlas->face, 0, (FT_UInt)atlas->pixel_size);
-
-    FT_Error err = FT_Load_Char(atlas->face, (FT_ULong)codepoint, FT_LOAD_RENDER);
-    if (err != 0 && codepoint != '?') {
-        err = FT_Load_Char(atlas->face, (FT_ULong)'?', FT_LOAD_RENDER);
-    }
-
-    if (err != 0) {
-        entry->valid = true;
-        entry->advance = atlas->pixel_size / 2;
-        return entry;
-    }
-
-    FT_GlyphSlot slot_glyph = atlas->face->glyph;
-    FT_Bitmap *bitmap = &slot_glyph->bitmap;
-
-    entry->width = (int)bitmap->width;
-    entry->height = (int)bitmap->rows;
-    entry->pitch = entry->width;
-    entry->advance = (int)(slot_glyph->advance.x >> 6);
-    entry->left = slot_glyph->bitmap_left;
-    entry->top = slot_glyph->bitmap_top;
-    entry->valid = true;
-
-    if (entry->width > 0 && entry->height > 0) {
-        size_t bytes = (size_t)entry->width * (size_t)entry->height;
-        entry->alpha = malloc(bytes);
-        if (!entry->alpha) {
-            entry->width = 0;
-            entry->height = 0;
-            entry->pitch = 0;
-            return entry;
-        }
-
-        for (int y = 0; y < entry->height; y++) {
-            memcpy(entry->alpha + ((size_t)y * (size_t)entry->width),
-                   bitmap->buffer + ((size_t)y * (size_t)bitmap->pitch),
-                   (size_t)entry->width);
-        }
-    }
-
-    return entry;
-}
-
-static GlyphCacheEntry *get_cached_glyph(FT_Face face, uint32_t codepoint) {
-    int pixel_size = current_face_pixel_size(face);
-    GlyphAtlas *atlas = get_font_atlas(face, pixel_size, true);
-    if (!atlas) return NULL;
-    return cache_glyph(atlas, codepoint);
-}
-
-static uint32_t utf8_next_codepoint(const char *text, size_t len, size_t *idx) {
-    if (!text || !idx || *idx >= len) return 0;
-
-    const unsigned char *s = (const unsigned char *)text;
-    unsigned char c0 = s[*idx];
-
-    if (c0 < 0x80) {
-        (*idx)++;
-        return (uint32_t)c0;
-    }
-
-    uint32_t codepoint = 0;
-    size_t need = 0;
-
-    if ((c0 & 0xE0) == 0xC0) {
-        codepoint = (uint32_t)(c0 & 0x1F);
-        need = 1;
-        if (codepoint == 0) { (*idx)++; return 0xFFFD; } // overlong lead
-    } else if ((c0 & 0xF0) == 0xE0) {
-        codepoint = (uint32_t)(c0 & 0x0F);
-        need = 2;
-    } else if ((c0 & 0xF8) == 0xF0) {
-        codepoint = (uint32_t)(c0 & 0x07);
-        need = 3;
-    } else {
-        (*idx)++;
-        return 0xFFFD;
-    }
-
-    if (*idx + need >= len) {
-        (*idx)++;
-        return 0xFFFD;
-    }
-
-    size_t start = *idx;
-    for (size_t n = 1; n <= need; n++) {
-        unsigned char cx = s[start + n];
-        if ((cx & 0xC0) != 0x80) {
-            (*idx)++;
-            return 0xFFFD;
-        }
-        codepoint = (codepoint << 6) | (uint32_t)(cx & 0x3F);
-    }
-
-    *idx += need + 1;
-
-    if ((need == 1 && codepoint < 0x80) ||
-        (need == 2 && codepoint < 0x800) ||
-        (need == 3 && codepoint < 0x10000) ||
-        codepoint > 0x10FFFF ||
-        (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
-        return 0xFFFD;
-    }
-
-    return codepoint;
-}
-
-static void warm_font_atlas(FT_Face face, int pixel_size) {
-    if (!face || pixel_size <= 0) return;
-
-    static const unsigned char preload[] =
-        " 0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        ":/-. ,()[]'\"&+#%_|!?@";
-
-    GlyphAtlas *atlas = get_font_atlas(face, pixel_size, true);
-    if (!atlas) return;
-
-    for (size_t i = 0; preload[i]; i++) {
-        cache_glyph(atlas, preload[i]);
-    }
-}
-
-static void warm_common_font_atlases(void) {
-    warm_font_atlas(g_font_bold, scale_font(130));
-    warm_font_atlas(g_font_bold, scale_font(70));
-    warm_font_atlas(g_font_bold, scale_font(26));
-    warm_font_atlas(g_font_reg, scale_font(22));
-    warm_font_atlas(g_font_reg, scale_font(20));
-    warm_font_atlas(g_font_reg, scale_font(16));
-    warm_font_atlas(g_font_reg, scale_font(11));
-}
-
-static void blend_alpha_rgb(uint8_t *dst, uint8_t r_text, uint8_t g_text, uint8_t b_text, uint8_t alpha) {
-    if (alpha == 0) return;
-
-    if (alpha == 255) {
-        dst[0] = r_text;
-        dst[1] = g_text;
-        dst[2] = b_text;
-        return;
-    }
-
-    uint16_t inv = (uint16_t)(255 - alpha);
-    dst[0] = fast_div_255((uint16_t)alpha * r_text + inv * dst[0]);
-    dst[1] = fast_div_255((uint16_t)alpha * g_text + inv * dst[1]);
-    dst[2] = fast_div_255((uint16_t)alpha * b_text + inv * dst[2]);
-}
-
-static void draw_cached_glyph_to_image_alpha(GlyphCacheEntry *glyph, int x_p, int y_p,
-                                             int clip_x0, int clip_y0, int clip_x1, int clip_y1,
-                                             uint32_t color, uint8_t global_alpha) {
-    if (!glyph || !glyph->alpha || glyph->width <= 0 || glyph->height <= 0) return;
-    if (global_alpha == 0) return;
-
-    uint8_t r_text = (uint8_t)((color >> 16) & 0xFF);
-    uint8_t g_text = (uint8_t)((color >> 8) & 0xFF);
-    uint8_t b_text = (uint8_t)(color & 0xFF);
-
-    for (int row = 0; row < glyph->height; row++) {
-        int ty = y_p + row;
-        if (ty < clip_y0 || ty >= clip_y1 || ty < 0 || ty >= g_height) continue;
-
-        for (int col = 0; col < glyph->width; col++) {
-            int tx = x_p + col;
-            if (tx < clip_x0 || tx >= clip_x1 || tx < 0 || tx >= g_width) continue;
-
-            uint8_t alpha = glyph->alpha[(size_t)row * (size_t)glyph->width + (size_t)col];
-            if (alpha == 0) continue;
-
-            if (global_alpha != 255) {
-                alpha = fast_div_255((uint16_t)alpha * (uint16_t)global_alpha);
-                if (alpha == 0) continue;
-            }
-
-            size_t idx = ((size_t)ty * (size_t)g_width + (size_t)tx) * 3;
-            blend_alpha_rgb(&g_img[idx], r_text, g_text, b_text, alpha);
-        }
-    }
-}
-
-static void draw_text_clipped_alpha(FT_Face face, const char *text, int x_start, int y_baseline,
-                                    int clip_x0, int clip_y0, int clip_x1, int clip_y1,
-                                    uint32_t color, uint8_t global_alpha) {
-    if (!face || !text || !*text) return;
-    if (global_alpha == 0) return;
-
-    clip_x0 = clamp_int(clip_x0, 0, g_width);
-    clip_x1 = clamp_int(clip_x1, 0, g_width);
-    clip_y0 = clamp_int(clip_y0, 0, g_height);
-    clip_y1 = clamp_int(clip_y1, 0, g_height);
-
-    if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) return;
-
-    int x = x_start;
-    size_t len = strlen(text);
-
-    for (size_t i = 0; i < len; ) {
-        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
-        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
-
-        if (!glyph) continue;
-
-        int x_p = x + glyph->left;
-        int y_p = y_baseline - glyph->top;
-        draw_cached_glyph_to_image_alpha(glyph, x_p, y_p, clip_x0, clip_y0, clip_x1, clip_y1, color, global_alpha);
-        x += glyph->advance;
-    }
-}
-
-static void draw_text_clipped(FT_Face face, const char *text, int x_start, int y_baseline,
-                              int clip_x0, int clip_y0, int clip_x1, int clip_y1,
-                              uint32_t color) {
-    draw_text_clipped_alpha(face, text, x_start, y_baseline, clip_x0, clip_y0, clip_x1, clip_y1, color, 255);
-}
-
-static void draw_text_alpha(FT_Face face, const char *text, int x_start, int y_baseline,
-                            uint32_t color, uint8_t global_alpha) {
-    draw_text_clipped_alpha(face, text, x_start, y_baseline, 0, 0, g_width, g_height, color, global_alpha);
-}
-
-static void draw_text(FT_Face face, const char *text, int x_start, int y_baseline, uint32_t color) {
-    draw_text_alpha(face, text, x_start, y_baseline, color, 255);
-}
-
-static void draw_text_to_rgb_buffer(FT_Face face, const char *text,
-                                    uint8_t *dst, int dst_w, int dst_h,
-                                    int x_start, int y_baseline,
-                                    uint32_t color) {
-    if (!face || !text || !*text || !dst || dst_w <= 0 || dst_h <= 0) return;
-
-    uint8_t r_text = (uint8_t)((color >> 16) & 0xFF);
-    uint8_t g_text = (uint8_t)((color >> 8) & 0xFF);
-    uint8_t b_text = (uint8_t)(color & 0xFF);
-
-    int x = x_start;
-    size_t len = strlen(text);
-
-    for (size_t i = 0; i < len; ) {
-        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
-        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
-        if (!glyph) continue;
-
-        int x_p = x + glyph->left;
-        int y_p = y_baseline - glyph->top;
-
-        if (glyph->alpha && glyph->width > 0 && glyph->height > 0) {
-            for (int row = 0; row < glyph->height; row++) {
-                int ty = y_p + row;
-                if (ty < 0 || ty >= dst_h) continue;
-
-                for (int col = 0; col < glyph->width; col++) {
-                    int tx = x_p + col;
-                    if (tx < 0 || tx >= dst_w) continue;
-
-                    uint8_t alpha = glyph->alpha[(size_t)row * (size_t)glyph->width + (size_t)col];
-                    if (alpha == 0) continue;
-
-                    size_t idx = ((size_t)ty * (size_t)dst_w + (size_t)tx) * 3;
-                    blend_alpha_rgb(&dst[idx], r_text, g_text, b_text, alpha);
-                }
-            }
-        }
-
-        x += glyph->advance;
-    }
-}
-
-static void format_duration_text(char *dst, size_t dst_sz, int seconds) {
-    if (!dst || dst_sz == 0) return;
-
-    if (seconds < 0) seconds = 0;
-
-    int h = seconds / 3600;
-    int m = (seconds % 3600) / 60;
-    int sec = seconds % 60;
-
-    if (h > 0) snprintf(dst, dst_sz, "%d:%02d:%02d", h, m, sec);
-    else snprintf(dst, dst_sz, "%d:%02d", m, sec);
-}
-
-static void build_audio_format_text(char *dst, size_t dst_sz) {
-    if (!dst || dst_sz == 0) return;
-
-    dst[0] = '\0';
-
-    const char *parts[3] = {
-        g_status_track_type,
-        g_status_samplerate,
-        g_status_bitdepth
-    };
-
-    for (int i = 0; i < 3; i++) {
-        const char *p = parts[i];
-        if (!p || !*p) continue;
-
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%s", p);
-        trim_in_place(tmp);
-        if (!tmp[0]) continue;
-
-        if (dst[0]) {
-            size_t used = strlen(dst);
-            if (used + 4 < dst_sz) {
-                snprintf(dst + used, dst_sz - used, " | ");
-            }
-        }
-
-        size_t used = strlen(dst);
-        if (used + 1 < dst_sz) {
-            snprintf(dst + used, dst_sz - used, "%s", tmp);
-        }
-    }
-}
-
-static int calculate_text_width(FT_Face face, const char *text) {
-    if (!face || !text || !*text) return 0;
-
-    int width = 0;
-    size_t len = strlen(text);
-
-    for (size_t i = 0; i < len; ) {
-        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
-        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
-        if (!glyph) continue;
-        width += glyph->advance;
-    }
-
-    return width;
-}
-
-static int text_top_offset_from_baseline(FT_Face face, const char *text) {
-    if (!face || !text || !*text) return 0;
-
-    int min_top = 0;
-    bool seen = false;
-    size_t len = strlen(text);
-
-    for (size_t i = 0; i < len; ) {
-        uint32_t codepoint = utf8_next_codepoint(text, len, &i);
-        GlyphCacheEntry *glyph = get_cached_glyph(face, codepoint);
-        if (!glyph) continue;
-
-        int top = -glyph->top;
-        if (!seen || top < min_top) {
-            min_top = top;
-            seen = true;
-        }
-    }
-
-    if (!seen && face->size) {
-        return -(int)(face->size->metrics.ascender >> 6);
-    }
-
-    return min_top;
-}
-
-static void draw_text_centered(FT_Face face, const char *text, int x0, int x1, int baseline_y, uint32_t color) {
-    int w = calculate_text_width(face, text ? text : "");
-    int x = x0 + ((x1 - x0 - w) / 2);
-    draw_text(face, text ? text : "", x, baseline_y, color);
+static void format_elapsed(char *dst, size_t dst_sz, double s) {
+    int v = (int)(s + 0.5);
+    snprintf(dst, dst_sz, "%d:%02d", v / 60, v % 60);
 }
 
 static void free_scroll_strip(void) {
-    free(g_scroll_strip_rgb);
-    g_scroll_strip_rgb = NULL;
+    free(g_scroll_strip_alpha);
+    g_scroll_strip_alpha = NULL;
     g_scroll_strip_w = 0;
     g_scroll_strip_h = 0;
     g_scroll_strip_cycle_w = 0;
-    g_scroll_strip_font_size = 0;
-    g_scroll_strip_clip_w = 0;
-    g_scroll_strip_clip_h = 0;
-    g_scroll_strip_baseline = 0;
-    g_scroll_strip_gap = 0;
-    g_scroll_strip_color = 0;
-    g_scroll_strip_face = NULL;
-    g_scroll_strip_text[0] = '\0';
-    g_scroll_strip_started_at = 0.0;
+    g_scroll_strip_text[0] = 0;
 }
 
-static bool ensure_scroll_strip(FT_Face face, const char *text, int font_size,
-                                int clip_w, int clip_h, int baseline_in_strip,
-                                int gap, uint32_t color, int text_w) {
-    if (!face || !text || !*text || font_size <= 0 || clip_w <= 0 || clip_h <= 0 || text_w <= 0) {
-        free_scroll_strip();
-        return false;
+static void strip_blend_glyph(uint8_t *strip, int sw, int sh, FT_Face face, int px, int x, int baseline, const char *text) {
+    int pen_x = x;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        GlyphCacheEntry *g = glyph_cache_get(face, px, *p);
+        if (!g) continue;
+        int gx = pen_x + g->left;
+        int gy = baseline - g->top;
+        for (int row = 0; row < g->height; row++) {
+            int yy = gy + row;
+            if (yy < 0 || yy >= sh) continue;
+            for (int col = 0; col < g->width; col++) {
+                int xx = gx + col;
+                if (xx < 0 || xx >= sw) continue;
+                uint8_t a = g->alpha[(size_t)row * g->width + col];
+                uint8_t *dp = strip + (size_t)yy * sw + xx;
+                if (a > *dp) *dp = a;
+            }
+        }
+        pen_x += g->advance;
     }
+}
 
-    int cycle_w = text_w + gap;
-    if (cycle_w <= 0) return false;
-
-    if (g_scroll_strip_rgb &&
-        g_scroll_strip_face == face &&
-        g_scroll_strip_font_size == font_size &&
-        g_scroll_strip_clip_w == clip_w &&
-        g_scroll_strip_clip_h == clip_h &&
-        g_scroll_strip_baseline == baseline_in_strip &&
-        g_scroll_strip_gap == gap &&
-        g_scroll_strip_color == color &&
-        strcmp(g_scroll_strip_text, text) == 0) {
-        return true;
-    }
+static bool ensure_scroll_strip(FT_Face face, int px, const char *title, int clip_w, int clip_h, uint32_t color) {
+    if (!face || !title || !*title || px <= 0 || clip_w <= 0 || clip_h <= 0) return false;
+    if (g_scroll_strip_alpha && g_scroll_strip_face == face && g_scroll_strip_px == px &&
+        g_scroll_strip_clip_w == clip_w && g_scroll_strip_h == clip_h &&
+        g_scroll_strip_color == color && strcmp(g_scroll_strip_text, title) == 0) return true;
 
     free_scroll_strip();
+    int gap = sx(60);
+    int title_w = text_width(face, px, title);
+    int cycle = title_w + gap;
+    int strip_w = cycle + title_w;
+    if (strip_w < clip_w + cycle) strip_w = clip_w + cycle;
+    if (strip_w <= 0) return false;
 
-    g_scroll_strip_w = cycle_w + clip_w + 2;
+    g_scroll_strip_alpha = calloc((size_t)strip_w * (size_t)clip_h, 1);
+    if (!g_scroll_strip_alpha) return false;
+
+    g_scroll_strip_w = strip_w;
     g_scroll_strip_h = clip_h;
-    g_scroll_strip_cycle_w = cycle_w;
-    g_scroll_strip_font_size = font_size;
+    g_scroll_strip_cycle_w = cycle;
+    g_scroll_strip_px = px;
     g_scroll_strip_clip_w = clip_w;
-    g_scroll_strip_clip_h = clip_h;
-    g_scroll_strip_baseline = baseline_in_strip;
-    g_scroll_strip_gap = gap;
     g_scroll_strip_color = color;
     g_scroll_strip_face = face;
-    snprintf(g_scroll_strip_text, sizeof(g_scroll_strip_text), "%s", text);
-    g_scroll_strip_started_at = monotonic_seconds();
+    safe_copy(g_scroll_strip_text, sizeof(g_scroll_strip_text), title);
 
-    size_t bytes = (size_t)g_scroll_strip_w * (size_t)g_scroll_strip_h * 3u;
-    g_scroll_strip_rgb = malloc(bytes);
-    if (!g_scroll_strip_rgb) {
-        free_scroll_strip();
-        return false;
-    }
-
-    uint8_t bg_r = (uint8_t)((BG_COLOR >> 16) & 0xFF);
-    uint8_t bg_g = (uint8_t)((BG_COLOR >> 8) & 0xFF);
-    uint8_t bg_b = (uint8_t)(BG_COLOR & 0xFF);
-
-    for (size_t i = 0; i < bytes; i += 3) {
-        g_scroll_strip_rgb[i + 0] = bg_r;
-        g_scroll_strip_rgb[i + 1] = bg_g;
-        g_scroll_strip_rgb[i + 2] = bg_b;
-    }
-
-    FT_Set_Pixel_Sizes(face, 0, (FT_UInt)font_size);
-    draw_text_to_rgb_buffer(face, text, g_scroll_strip_rgb, g_scroll_strip_w, g_scroll_strip_h,
-                            0, baseline_in_strip, color);
-    draw_text_to_rgb_buffer(face, text, g_scroll_strip_rgb, g_scroll_strip_w, g_scroll_strip_h,
-                            cycle_w, baseline_in_strip, color);
-
+    int baseline = px;
+    strip_blend_glyph(g_scroll_strip_alpha, strip_w, clip_h, face, px, 0, baseline, title);
+    strip_blend_glyph(g_scroll_strip_alpha, strip_w, clip_h, face, px, cycle, baseline, title);
     return true;
 }
 
-static void draw_scroll_strip_window(int dst_x, int dst_y, int clip_w, int clip_h, int offset) {
-    if (!g_scroll_strip_rgb || !g_img || clip_w <= 0 || clip_h <= 0) return;
-    if (g_scroll_strip_cycle_w <= 0) return;
-
-    offset %= g_scroll_strip_cycle_w;
-    if (offset < 0) offset += g_scroll_strip_cycle_w;
-
-    for (int y = 0; y < clip_h; y++) {
-        int out_y = dst_y + y;
-        if (out_y < 0 || out_y >= g_height) continue;
-
-        int out_x = dst_x;
-        int copy_w = clip_w;
-        int src_x = offset;
-
-        if (out_x < 0) {
-            int shift = -out_x;
-            src_x += shift;
-            copy_w -= shift;
-            out_x = 0;
-        }
-
-        if (out_x + copy_w > g_width) {
-            copy_w = g_width - out_x;
-        }
-
-        if (copy_w <= 0) continue;
-        if (src_x + copy_w > g_scroll_strip_w) {
-            copy_w = g_scroll_strip_w - src_x;
-        }
-        if (copy_w <= 0) continue;
-
-        size_t src_idx = ((size_t)y * (size_t)g_scroll_strip_w + (size_t)src_x) * 3u;
-        size_t dst_idx = ((size_t)out_y * (size_t)g_width + (size_t)out_x) * 3u;
-        memcpy(g_img + dst_idx, g_scroll_strip_rgb + src_idx, (size_t)copy_w * 3u);
-    }
-}
-
-
-static inline uint8_t composite_channel_over_bg(uint8_t src, uint8_t alpha, uint8_t bg) {
-    if (alpha == 255) return src;
-    if (alpha == 0) return bg;
-    return fast_div_255((uint16_t)alpha * src + (uint16_t)(255 - alpha) * bg);
-}
-
-// Generates the scaled album art cache once
-static void scale_art_once(int target_w, int target_h) {
-    if (g_cached_art_w == target_w &&
-        g_cached_art_h == target_h &&
-        g_art_scaled_rgb &&
-        g_art_scaled_generation == g_art_generation) {
+static void draw_scrolling_title(int x, int y, int w, int h, const char *title, bool scroll, bool moving, double now) {
+    int px = sf(g_cfg.ui.title_font_size);
+    if (!scroll) {
+        draw_text_clip(g_font_bold, px, x, y, title, g_cfg.ui.color_text_main, 255, x, y - px, x + w, y + h);
         return;
     }
 
-    free_scaled_art();
+    int strip_h = h + px;
+    if (!ensure_scroll_strip(g_font_bold, px, title, w, strip_h, g_cfg.ui.color_text_main)) return;
+    double speed = sx(42);
+    int off = moving ? (int)fmod(now * speed, (double)max_i(1, g_scroll_strip_cycle_w)) : 0;
+    int target_y = y - px;
 
-    if (!g_art_rgba || g_art_w <= 0 || g_art_h <= 0 || target_w <= 0 || target_h <= 0) return;
-
-    g_art_scaled_rgb = malloc((size_t)target_w * (size_t)target_h * 3);
-    if (!g_art_scaled_rgb) return;
-
-    g_cached_art_w = target_w;
-    g_cached_art_h = target_h;
-    g_art_scaled_generation = g_art_generation;
-
-    int x_step = (target_w > 1) ? (int)(((int64_t)(g_art_w - 1) << 16) / (target_w - 1)) : 0;
-    int y_step = (target_h > 1) ? (int)(((int64_t)(g_art_h - 1) << 16) / (target_h - 1)) : 0;
-
-    const uint8_t bg[3] = {
-        (uint8_t)((BG_COLOR >> 16) & 0xFF),
-        (uint8_t)((BG_COLOR >> 8) & 0xFF),
-        (uint8_t)(BG_COLOR & 0xFF)
-    };
-
-    int src_y_fp = 0;
-
-    for (int y = 0; y < target_h; y++) {
-        int y0 = src_y_fp >> 16;
-        int y_frac = src_y_fp & 0xFFFF;
-        if (y0 >= g_art_h) y0 = g_art_h - 1;
-        int y1 = (y0 + 1 >= g_art_h) ? g_art_h - 1 : y0 + 1;
-
-        uint32_t wy1 = (uint32_t)y_frac;
-        uint32_t wy0 = (uint32_t)(FIXED_ONE - y_frac);
-
-        int src_x_fp = 0;
-        size_t dst_row_idx = (size_t)y * target_w * 3;
-
-        for (int x = 0; x < target_w; x++) {
-            int x0 = src_x_fp >> 16;
-            int x_frac = src_x_fp & 0xFFFF;
-            if (x0 >= g_art_w) x0 = g_art_w - 1;
-            int x1 = (x0 + 1 >= g_art_w) ? g_art_w - 1 : x0 + 1;
-
-            uint32_t wx1 = (uint32_t)x_frac;
-            uint32_t wx0 = (uint32_t)(FIXED_ONE - x_frac);
-
-            uint64_t w00 = (uint64_t)wx0 * wy0;
-            uint64_t w10 = (uint64_t)wx1 * wy0;
-            uint64_t w01 = (uint64_t)wx0 * wy1;
-            uint64_t w11 = (uint64_t)wx1 * wy1;
-
-            size_t idx_00 = ((size_t)y0 * g_art_w + x0) * 4;
-            size_t idx_10 = ((size_t)y0 * g_art_w + x1) * 4;
-            size_t idx_01 = ((size_t)y1 * g_art_w + x0) * 4;
-            size_t idx_11 = ((size_t)y1 * g_art_w + x1) * 4;
-
-            uint8_t a00 = g_art_rgba[idx_00 + 3];
-            uint8_t a10 = g_art_rgba[idx_10 + 3];
-            uint8_t a01 = g_art_rgba[idx_01 + 3];
-            uint8_t a11 = g_art_rgba[idx_11 + 3];
-
-            for (int c = 0; c < 3; c++) {
-                uint8_t c00 = composite_channel_over_bg(g_art_rgba[idx_00 + c], a00, bg[c]);
-                uint8_t c10 = composite_channel_over_bg(g_art_rgba[idx_10 + c], a10, bg[c]);
-                uint8_t c01 = composite_channel_over_bg(g_art_rgba[idx_01 + c], a01, bg[c]);
-                uint8_t c11 = composite_channel_over_bg(g_art_rgba[idx_11 + c], a11, bg[c]);
-
-                uint64_t value =
-                    ((uint64_t)c00 * w00) +
-                    ((uint64_t)c10 * w10) +
-                    ((uint64_t)c01 * w01) +
-                    ((uint64_t)c11 * w11);
-
-                g_art_scaled_rgb[dst_row_idx + (x * 3) + c] = (uint8_t)((value + (1ULL << 31)) >> 32);
-            }
-            src_x_fp += x_step;
-        }
-        src_y_fp += y_step;
-    }
-
-    DBG_LOG("Album art scaled: generation=%lu target=%dx%d source=%dx%d",
-            g_art_scaled_generation, target_w, target_h, g_art_w, g_art_h);
-}
-
-// Blits pre-scaled cache directly to the frame 
-static void draw_album_art_cached(int target_x, int target_y, int target_w, int target_h) {
-    scale_art_once(target_w, target_h);
-    if (!g_art_scaled_rgb) return;
-
-    for (int y = 0; y < target_h; y++) {
-        int out_y = target_y + y;
-        if (out_y < 0 || out_y >= g_height) continue;
-
-        int out_x = target_x;
-        int copy_w = target_w;
-        int src_offset_pixels = 0;
-
-        if (out_x < 0) {
-            copy_w += out_x;
-            src_offset_pixels = -out_x;
-            out_x = 0;
-        }
-        if (out_x + copy_w > g_width) {
-            copy_w = g_width - out_x;
-        }
-
-        if (copy_w > 0) {
-            size_t src_idx = ((size_t)y * target_w + src_offset_pixels) * 3;
-            size_t dst_idx = ((size_t)out_y * g_width + out_x) * 3;
-            memcpy(&g_img[dst_idx], &g_art_scaled_rgb[src_idx], (size_t)copy_w * 3);
+    for (int row = 0; row < strip_h; row++) {
+        int yy = target_y + row;
+        if (yy < 0 || yy >= g_h) continue;
+        for (int col = 0; col < w; col++) {
+            int xx = x + col;
+            if (xx < 0 || xx >= g_w) continue;
+            int src_x = off + col;
+            if (src_x >= g_scroll_strip_w) src_x %= max_i(1, g_scroll_strip_cycle_w);
+            uint8_t a = g_scroll_strip_alpha[(size_t)row * g_scroll_strip_w + src_x];
+            if (a) blend_pixel(xx, yy, g_cfg.ui.color_text_main, a);
         }
     }
 }
 
-static void dim_rect_rgb_percent(int x, int y, int w, int h, uint8_t percent) {
-    if (!g_img || w <= 0 || h <= 0) return;
-    if (percent > 100) percent = 100;
+static void draw_spotify_screen(const PlayerState *s, const AudioInfo *a, bool audio_running, double now) {
+    int p = sx(g_cfg.ui.padding);
+    int header_h = sy(g_cfg.ui.header_height);
+    int art = sy(g_cfg.ui.album_art_size);
+    int ax = p;
+    int ay = header_h + sy(26);
+    int tx = ax + art + p;
+    int tw = ui_text_width_from(tx);
+    int title_px = sf(g_cfg.ui.title_font_size);
+    bool title_scrolls = text_width(g_font_bold, title_px, s->title) > tw;
+    bool fade_bg = g_cfg.album_bg_fade_when_title_scrolls && title_scrolls;
 
-    int x0 = clamp_int(x, 0, g_width);
-    int y0 = clamp_int(y, 0, g_height);
-    int x1 = clamp_int(x + w, 0, g_width);
-    int y1 = clamp_int(y + h, 0, g_height);
+    draw_album_background(fade_bg);
+    fill_rect(0, 0, g_w, header_h, g_cfg.ui.color_background);
+    draw_clock_text(g_w - sx(52), header_h - sy(9), sf(g_cfg.ui.small_clock_font_size), g_cfg.ui.color_text_dim, now);
+    draw_text(g_font_reg, sf(g_cfg.ui.source_font_size), sx(14), header_h - sy(10), "Spotify", g_cfg.ui.color_text_dim);
 
-    if (x1 <= x0 || y1 <= y0) return;
-
-    for (int cy = y0; cy < y1; cy++) {
-        uint8_t *row = g_img + ((size_t)cy * (size_t)g_width + (size_t)x0) * 3u;
-        for (int cx = x0; cx < x1; cx++) {
-            row[0] = (uint8_t)(((unsigned int)row[0] * (unsigned int)percent) / 100u);
-            row[1] = (uint8_t)(((unsigned int)row[1] * (unsigned int)percent) / 100u);
-            row[2] = (uint8_t)(((unsigned int)row[2] * (unsigned int)percent) / 100u);
-            row += 3;
-        }
+    if (g_art_rgba) draw_cached_album_art(ax, ay, art, art);
+    else {
+        fill_rect(ax, ay, art, art, g_cfg.ui.color_album_placeholder);
+        draw_text(g_font_reg, sf(g_cfg.ui.source_font_size), ax + sx(25), ay + art / 2, "No Art", g_cfg.ui.color_text_muted);
     }
+
+    draw_scrolling_title(tx, sy(82), tw, sy(34), s->title[0] ? s->title : "Spotify", title_scrolls, audio_running, now);
+    draw_text_clip(g_font_reg, sf(g_cfg.ui.artist_font_size), tx, sy(118), s->artist, g_cfg.ui.color_text_dim, 255, tx, 0, tx + tw, g_h);
+    draw_text_clip(g_font_reg, sf(g_cfg.ui.album_font_size), tx, sy(145), s->album, g_cfg.ui.color_text_muted, 255, tx, 0, tx + tw, g_h);
+
+    int py = sy(225);
+    int bar_h = sy(g_cfg.ui.progress_bar_height);
+    draw_progress(p + sx(4), py, g_w - (p + sx(4)) * 2, bar_h, s->seek, s->duration);
+
+    char left[32], right[32];
+    format_elapsed(left, sizeof(left), s->seek);
+    format_elapsed(right, sizeof(right), s->duration);
+    int time_px = sf(g_cfg.ui.footer_font_size + 2);
+    draw_text(g_font_reg, time_px, p + sx(4), py + sy(24), left, g_cfg.ui.color_text_dim);
+    draw_text(g_font_reg, time_px, g_w - p - sx(4) - text_width(g_font_reg, time_px, right), py + sy(24), right, g_cfg.ui.color_text_dim);
+    draw_truth_footer(s, a, false, now);
 }
 
-static bool ensure_album_background_layer(void) {
-    if (g_width <= 0 || g_height <= 0) return false;
+static void draw_airplay_screen(const PlayerState *s, const AudioInfo *a, double now) {
+    (void)now;
+    clear_screen(g_cfg.ui.color_background);
+    int cx = g_w / 2;
+    int cy = g_h / 2 - sy(18);
 
-    size_t needed = (size_t)g_width * (size_t)g_height * 3u;
-    if (needed == 0) return false;
+    int screen_w = sx(g_cfg.ui.airplay_icon_width);
+    int screen_h = sy(g_cfg.ui.airplay_icon_height);
+    int sx0 = cx - screen_w / 2;
+    int sy0 = cy - screen_h / 2;
 
-    if (g_album_bg_rgb && g_album_bg_w == g_width && g_album_bg_h == g_height) {
-        return true;
+    fill_rect(sx0, sy0, screen_w, screen_h, g_cfg.ui.color_album_placeholder);
+    fill_rect(sx0 + sx(6), sy0 + sy(6), screen_w - sx(12), screen_h - sy(12), g_cfg.ui.color_background);
+    fill_rect(sx0 + sx(6), sy0 + sy(6), screen_w - sx(12), sy(2), g_cfg.ui.color_panel_line);
+
+    int tri_top = sy0 + screen_h + sy(8);
+    int tri_h = sy(42);
+    for (int row = 0; row < tri_h; row++) {
+        int half = row * sx(38) / max_i(1, tri_h);
+        fill_rect(cx - half, tri_top + row, half * 2 + 1, 1, g_cfg.ui.color_text_main);
     }
 
-    uint8_t *new_layer = realloc(g_album_bg_rgb, needed);
-    if (!new_layer) {
-        free(g_album_bg_rgb);
-        g_album_bg_rgb = NULL;
-        g_album_bg_w = 0;
-        g_album_bg_h = 0;
-        return false;
+    char fmt[96];
+    compact_audio_format(a, fmt, sizeof(fmt));
+    if (fmt[0] && strcmp(fmt, "closed") != 0) {
+        int px = sf(g_cfg.ui.source_font_size);
+        draw_text(g_font_reg, px, cx - text_width(g_font_reg, px, fmt) / 2, cy + sy(112), fmt, g_cfg.ui.color_text_muted);
     }
 
-    g_album_bg_rgb = new_layer;
-    g_album_bg_w = g_width;
-    g_album_bg_h = g_height;
-    g_album_bg_generation = 0;
-    return true;
+    (void)s;
 }
 
+static void draw_generic_screen(const PlayerState *s, const AudioInfo *a, bool audio_running, double now) {
+    int p = sx(g_cfg.ui.padding);
+    int header_h = sy(g_cfg.ui.header_height);
+    clear_screen(g_cfg.ui.color_background);
+    draw_clock_text(g_w - sx(52), header_h - sy(9), sf(g_cfg.ui.small_clock_font_size), g_cfg.ui.color_text_dim, now);
+    const char *src = s->service[0] ? s->service : "Volumio";
+    draw_text(g_font_reg, sf(g_cfg.ui.source_font_size), sx(14), header_h - sy(10), src, g_cfg.ui.color_text_dim);
 
-static bool album_background_allowed_now(double now) {
-    if (!g_art_rgba) return false;
-    if (g_art_is_default_fallback || g_art_is_pulse_fallback) return false;
+    int art = sy(g_cfg.ui.generic_album_art_size);
+    int ax = p;
+    int ay = header_h + sy(32);
+    if (g_art_rgba) draw_cached_album_art(ax, ay, art, art);
 
-    // The decorative background must obey the same configured stable-track
-    // delay as the foreground artwork lookup. It should not use its own extra
-    // post-load timer, because that makes the background timing drift from the
-    // artwork lookup timing.
-    if (g_art_lookup_track_since < 0.0) return false;
-
-    if (g_cfg_album_art_lookup_delay_seconds > 0.0 &&
-        now - g_art_lookup_track_since < g_cfg_album_art_lookup_delay_seconds) {
-        return false;
-    }
-
-    // If the lookup state has already moved to another track, do not build a
-    // background from stale art. The next real-art success will re-enable it.
-    if (g_art_lookup_track_key[0] && strcmp(g_art_loaded_track_key, g_art_lookup_track_key) != 0) {
-        return false;
-    }
-
-    return true;
+    int tx = ax + art + p;
+    int tw = ui_text_width_from(tx);
+    int title_px = sf(g_cfg.ui.title_font_size);
+    bool scroll = text_width(g_font_bold, title_px, s->title) > tw;
+    draw_scrolling_title(tx, sy(92), tw, sy(36), s->title[0] ? s->title : src, scroll, audio_running, now);
+    draw_text_clip(g_font_reg, sf(g_cfg.ui.artist_font_size), tx, sy(126), s->artist, g_cfg.ui.color_text_dim, 255, tx, 0, tx + tw, g_h);
+    draw_text_clip(g_font_reg, sf(g_cfg.ui.album_font_size), tx, sy(153), s->album, g_cfg.ui.color_text_muted, 255, tx, 0, tx + tw, g_h);
+    draw_progress(p + sx(4), sy(225), g_w - (p + sx(4)) * 2, sy(g_cfg.ui.progress_bar_height), s->seek, s->duration);
+    draw_truth_footer(s, a, false, now);
 }
 
-static void draw_album_art_background_zoomed(void) {
-    if (!g_img || !g_art_rgba || g_art_is_default_fallback) return;
-    if (g_art_w <= 0 || g_art_h <= 0 || g_width <= 0 || g_height <= 0) return;
-    if (!ensure_album_background_layer()) return;
+static void draw_idle(double now) {
+    clear_screen(g_cfg.ui.color_background);
 
-    size_t layer_bytes = (size_t)g_width * (size_t)g_height * 3u;
+    draw_clock_text(g_w / 2, g_h / 2 + sy(26), sf(g_cfg.ui.idle_clock_font_size), g_cfg.ui.color_text_main, now);
 
-    // Expensive path is only run when the artwork generation or geometry changes.
-    // Normal frames only memcpy the already-matted layer into g_img.
-    if (g_album_bg_generation != g_art_generation) {
-        const int zoom_percent = 220;
-        const int brightness_percent = 28;
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
 
-        // 0 = bottom-left, 255 = top-right.
-        // Fade band starts before the screen center and reaches black before
-        // the title/clock region.
-        const int diagonal_fade_start = 96;
-        const int diagonal_fade_end = 144;
+    char date[64];
+    strftime(date, sizeof(date), "%A, %B %d", &tmv);
+    int date_px = sf(g_cfg.ui.idle_date_font_size);
+    draw_text(g_font_reg, date_px,
+              g_w / 2 - text_width(g_font_reg, date_px, date) / 2,
+              g_h / 2 + sy(70), date, g_cfg.ui.color_text_dim);
 
-        double cover_scale_x = (double)g_width / (double)g_art_w;
-        double cover_scale_y = (double)g_height / (double)g_art_h;
-        double cover_scale = cover_scale_x > cover_scale_y ? cover_scale_x : cover_scale_y;
-        double scale = cover_scale * ((double)zoom_percent / 100.0);
-
-        if (scale <= 0.0) return;
-
-        int crop_w_fp = (int)(((double)g_width / scale) * (double)FIXED_ONE);
-        int crop_h_fp = (int)(((double)g_height / scale) * (double)FIXED_ONE);
-
-        if (crop_w_fp <= 0 || crop_h_fp <= 0) return;
-
-        int src_x_start_fp = (((int)g_art_w * FIXED_ONE) - crop_w_fp) / 2;
-        int src_y_start_fp = (((int)g_art_h * FIXED_ONE) - crop_h_fp) / 2;
-        int x_step = crop_w_fp / g_width;
-        int y_step = crop_h_fp / g_height;
-
-        if (x_step <= 0) x_step = 1;
-        if (y_step <= 0) y_step = 1;
-
-        const uint8_t bg[3] = {
-            (uint8_t)((BG_COLOR >> 16) & 0xFF),
-            (uint8_t)((BG_COLOR >> 8) & 0xFF),
-            (uint8_t)(BG_COLOR & 0xFF)
-        };
-
-        int width_denom = g_width > 1 ? g_width - 1 : 1;
-        int height_denom = g_height > 1 ? g_height - 1 : 1;
-        int src_y_fp = src_y_start_fp;
-
-        for (int y = 0; y < g_height; y++) {
-            int sy = src_y_fp >> 16;
-            sy = clamp_int(sy, 0, g_art_h - 1);
-
-            int inv_y_255 = ((height_denom - y) * 255) / height_denom;
-            int src_x_fp = src_x_start_fp;
-            uint8_t *dst = g_album_bg_rgb + ((size_t)y * (size_t)g_width * 3u);
-
-            for (int x = 0; x < g_width; x++) {
-                int sx = src_x_fp >> 16;
-                sx = clamp_int(sx, 0, g_art_w - 1);
-
-                size_t src_idx = ((size_t)sy * (size_t)g_art_w + (size_t)sx) * 4u;
-                uint8_t a = g_art_rgba[src_idx + 3];
-
-                uint8_t r = composite_channel_over_bg(g_art_rgba[src_idx + 0], a, bg[0]);
-                uint8_t g = composite_channel_over_bg(g_art_rgba[src_idx + 1], a, bg[1]);
-                uint8_t b = composite_channel_over_bg(g_art_rgba[src_idx + 2], a, bg[2]);
-
-                int nx_255 = (x * 255) / width_denom;
-                int diag = (nx_255 + inv_y_255) / 2;
-                int keep = 255;
-
-                if (diag >= diagonal_fade_end) {
-                    keep = 0;
-                } else if (diag > diagonal_fade_start) {
-                    int t = ((diag - diagonal_fade_start) * 255) /
-                            (diagonal_fade_end - diagonal_fade_start);
-                    if (t < 0) t = 0;
-                    if (t > 255) t = 255;
-
-                    int tt = (t * t + 127) / 255;
-                    int smooth = (tt * (765 - (2 * t)) + 127) / 255;
-                    keep = 255 - smooth;
-                }
-
-                unsigned int br = ((unsigned int)r * (unsigned int)brightness_percent) / 100u;
-                unsigned int bgc = ((unsigned int)g * (unsigned int)brightness_percent) / 100u;
-                unsigned int bb = ((unsigned int)b * (unsigned int)brightness_percent) / 100u;
-
-                dst[0] = (uint8_t)((br * (unsigned int)keep) / 255u);
-                dst[1] = (uint8_t)((bgc * (unsigned int)keep) / 255u);
-                dst[2] = (uint8_t)((bb * (unsigned int)keep) / 255u);
-
-                dst += 3;
-                src_x_fp += x_step;
-            }
-
-            src_y_fp += y_step;
-        }
-
-        g_album_bg_generation = g_art_generation;
-    }
-
-    memcpy(g_img, g_album_bg_rgb, layer_bytes);
+    char ip[64];
+    get_primary_ipv4(ip, sizeof(ip));
+    int ip_px = sf(g_cfg.ui.idle_ip_font_size);
+    draw_text(g_font_reg, ip_px,
+              g_w / 2 - text_width(g_font_reg, ip_px, ip) / 2,
+              g_h / 2 + sy(102), ip, g_cfg.ui.color_text_muted);
 }
 
-// ---------------- Framebuffer ----------------
-
-static uint32_t scale_channel_to_length(uint8_t v, uint32_t length) {
-    if (length == 0) return 0;
-    if (length >= 8) return (uint32_t)v << (length - 8);
-
-    uint32_t max_v = (1u << length) - 1u;
-    return ((uint32_t)v * max_v + 127u) / 255u;
-}
-
-static void init_pixel_luts(void) {
-    for (int i = 0; i < 256; i++) {
-        g_r_lut[i] = scale_channel_to_length((uint8_t)i, g_vinfo.red.length) << g_vinfo.red.offset;
-        g_g_lut[i] = scale_channel_to_length((uint8_t)i, g_vinfo.green.length) << g_vinfo.green.offset;
-        g_b_lut[i] = scale_channel_to_length((uint8_t)i, g_vinfo.blue.length) << g_vinfo.blue.offset;
-    }
-}
-
-static inline uint32_t rgb_to_native_pixel(uint8_t r, uint8_t g, uint8_t b) {
-    return g_r_lut[r] | g_g_lut[g] | g_b_lut[b];
-}
-
-static void set_default_fb_masks_if_missing(void) {
-    if (g_vinfo.red.length && g_vinfo.green.length && g_vinfo.blue.length) return;
-
-    memset(&g_vinfo.red, 0, sizeof(g_vinfo.red));
-    memset(&g_vinfo.green, 0, sizeof(g_vinfo.green));
-    memset(&g_vinfo.blue, 0, sizeof(g_vinfo.blue));
-
-    if (g_bpp == 16) {
-        g_vinfo.red.offset = 11;
-        g_vinfo.red.length = 5;
-        g_vinfo.green.offset = 5;
-        g_vinfo.green.length = 6;
-        g_vinfo.blue.offset = 0;
-        g_vinfo.blue.length = 5;
-    } else {
-        g_vinfo.red.offset = 16;
-        g_vinfo.red.length = 8;
-        g_vinfo.green.offset = 8;
-        g_vinfo.green.length = 8;
-        g_vinfo.blue.offset = 0;
-        g_vinfo.blue.length = 8;
-    }
-}
-
-static bool open_framebuffer(void) {
-    g_fb_fd = open(g_cfg_fb_path, O_RDWR | O_CLOEXEC);
-    if (g_fb_fd < 0) {
-        perror("[FB Error] open");
-        DBG_LOG("Framebuffer open failed path=%s errno=%d", g_cfg_fb_path, errno);
-        return false;
-    }
-
-    memset(&g_vinfo, 0, sizeof(g_vinfo));
-    memset(&g_finfo, 0, sizeof(g_finfo));
-
-    if (ioctl(g_fb_fd, FBIOGET_VSCREENINFO, &g_vinfo) == 0) {
-        g_width = (int)g_vinfo.xres;
-        g_height = (int)g_vinfo.yres;
-        g_bpp = (int)g_vinfo.bits_per_pixel;
-    } else {
-        printf("[FB Warning] FBIOGET_VSCREENINFO failed. Falling back to config geometry.\n");
-        DBG_LOG("FBIOGET_VSCREENINFO failed errno=%d, fallback=%dx%d", errno, g_cfg_width, g_cfg_height);
-        g_width = g_cfg_width;
-        g_height = g_cfg_height;
-        g_bpp = 16;
-    }
-
-    if (g_width <= 0) g_width = DESIGN_WIDTH;
-    if (g_height <= 0) g_height = DESIGN_HEIGHT;
-    if (g_bpp <= 0) g_bpp = 16;
-
-    if (g_bpp != 16 && g_bpp != 24 && g_bpp != 32) {
-        fprintf(stderr, "[FB Error] Unsupported framebuffer depth: %d bpp. Supported: 16, 24, 32.\n", g_bpp);
-        DBG_LOG("Unsupported framebuffer depth: %d", g_bpp);
-        close(g_fb_fd);
-        g_fb_fd = -1;
-        return false;
-    }
-
-    g_bytes_per_pixel = (g_bpp + 7) / 8;
-
-    if (ioctl(g_fb_fd, FBIOGET_FSCREENINFO, &g_finfo) == 0 && g_finfo.line_length > 0) {
-        g_line_length = (int)g_finfo.line_length;
-    } else {
-        g_line_length = g_width * g_bytes_per_pixel;
-        printf("[FB Warning] FBIOGET_FSCREENINFO failed. Assuming stride %d.\n", g_line_length);
-        DBG_LOG("FBIOGET_FSCREENINFO failed errno=%d assumed_stride=%d", errno, g_line_length);
-    }
-
-    set_default_fb_masks_if_missing();
-    init_pixel_luts(); 
-
-    g_fb_map_bytes = (size_t)g_line_length * (size_t)g_height;
-
-    g_fb_mem = mmap(NULL, g_fb_map_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
-    if (g_fb_mem == MAP_FAILED) {
-        perror("[FB Error] mmap");
-        g_fb_mem = NULL;
-        close(g_fb_fd);
-        g_fb_fd = -1;
-        return false;
-    }
-
-    printf("[FB Discovery] %dx%d, %d bpp, stride %d bytes, framebuffer %s\n",
-           g_width, g_height, g_bpp, g_line_length, g_cfg_fb_path);
-    DBG_LOG("Framebuffer opened: %dx%d bpp=%d stride=%d path=%s",
-            g_width, g_height, g_bpp, g_line_length, g_cfg_fb_path);
-
-    return true;
-}
-
-static void close_framebuffer(void) {
-    if (g_fb_mem && g_fb_mem != MAP_FAILED) {
-        munmap(g_fb_mem, g_fb_map_bytes);
-        g_fb_mem = NULL;
-    }
-
-    if (g_fb_fd >= 0) {
-        close(g_fb_fd);
-        g_fb_fd = -1;
-    }
-}
-
-static void blank_physical_framebuffer(uint32_t color) {
-    if (!g_fb_mem || g_fb_mem == MAP_FAILED) return;
-    if (g_width <= 0 || g_height <= 0 || g_line_length <= 0 || g_bytes_per_pixel <= 0) return;
-
-    uint8_t r = (uint8_t)((color >> 16) & 0xFF);
-    uint8_t g = (uint8_t)((color >> 8) & 0xFF);
-    uint8_t b = (uint8_t)(color & 0xFF);
-    uint32_t native = rgb_to_native_pixel(r, g, b);
-
-    for (int y = 0; y < g_height; y++) {
-        uint8_t *row = g_fb_mem + ((size_t)y * (size_t)g_line_length);
-        for (int x = 0; x < g_width; x++) {
-            uint8_t *dst = row + ((size_t)x * (size_t)g_bytes_per_pixel);
-            memcpy(dst, &native, (size_t)g_bytes_per_pixel);
-        }
-    }
-
-    if (g_fb_map_bytes > 0) {
-        (void)msync(g_fb_mem, g_fb_map_bytes, MS_ASYNC);
-    }
-
-    size_t total_pixels = (size_t)g_width * (size_t)g_height;
-    if (g_img) memset(g_img, 0, total_pixels * 3);
-    if (g_native) memset(g_native, 0, total_pixels * sizeof(uint32_t));
-    if (g_prev_native) memset(g_prev_native, 0, total_pixels * sizeof(uint32_t));
-    if (g_native16) memset(g_native16, 0, total_pixels * sizeof(uint16_t));
-    if (g_prev_native16) memset(g_prev_native16, 0, total_pixels * sizeof(uint16_t));
-    g_prev_frame_valid = false;
-}
-
-static void build_native_from_rgb_frame(void) {
-    if (!g_img) return;
-
-    size_t total_pixels = (size_t)g_width * (size_t)g_height;
-
-    if (g_bpp == 16 && g_native16) {
-        for (size_t i = 0; i < total_pixels; i++) {
-            size_t img_idx = i * 3u;
-            g_native16[i] = (uint16_t)rgb_to_native_pixel(g_img[img_idx + 0], g_img[img_idx + 1], g_img[img_idx + 2]);
-        }
-        return;
-    }
-
-    if (!g_native) return;
-
-    for (size_t i = 0; i < total_pixels; i++) {
-        size_t img_idx = i * 3u;
-        g_native[i] = rgb_to_native_pixel(g_img[img_idx + 0], g_img[img_idx + 1], g_img[img_idx + 2]);
-    }
-}
-
-static void write_native_span_to_fb(int y, int start_x, int end_x) {
-    if (!g_fb_mem) return;
-    if (y < 0 || y >= g_height) return;
-
-    start_x = clamp_int(start_x, 0, g_width - 1);
-    end_x = clamp_int(end_x, 0, g_width - 1);
-    if (end_x < start_x) return;
-
-    int length = (end_x - start_x) + 1;
-
-    if (g_bpp == 16) {
-        if (!g_native16) return;
-
-        // True packed 16-bit path. g_native is uint32_t-per-pixel, so never cast it to uint16_t*.
-        // This packed cache exists specifically so dirty spans can be copied with one memcpy per row span.
-        uint16_t *fb_pixel = (uint16_t *)(g_fb_mem + ((size_t)y * (size_t)g_line_length)) + start_x;
-        uint16_t *src_pixel = g_native16 + ((size_t)y * (size_t)g_width) + start_x;
-        memcpy(fb_pixel, src_pixel, (size_t)length * sizeof(uint16_t));
-    } else if (g_bpp == 32) {
-        // 32-bit native framebuffer path. One continuous transfer for the dirty row span.
-        uint32_t *fb_pixel = (uint32_t *)(g_fb_mem + ((size_t)y * (size_t)g_line_length)) + start_x;
-        uint32_t *src_pixel = g_native + ((size_t)y * (size_t)g_width) + start_x;
-        memcpy(fb_pixel, src_pixel, (size_t)length * sizeof(uint32_t));
-    } else {
-        // 24-bit and unusual packed formats. Keep the known-safe byte copy fallback.
-        uint8_t *dst = g_fb_mem
-            + ((size_t)y * (size_t)g_line_length)
-            + ((size_t)start_x * (size_t)g_bytes_per_pixel);
-        uint32_t *src = g_native + ((size_t)y * (size_t)g_width) + start_x;
-
-        for (int x = 0; x < length; x++) {
-            memcpy(dst, src, (size_t)g_bytes_per_pixel);
-            dst += g_bytes_per_pixel;
-            src++;
-        }
-    }
-}
-
-static void flush_native_to_fb(void) {
-    if (g_fb_fd < 0 || !g_fb_mem || !g_img) return;
-    if (g_bpp == 16) {
-        if (!g_native16 || !g_prev_native16) return;
-    } else {
-        if (!g_native || !g_prev_native) return;
-    }
-
-    bool wrote_any = false;
-
-    build_native_from_rgb_frame();
-
-    if (!g_dirty_spans) {
-        g_dirty_spans = malloc(sizeof(RowSpanTracker) * (size_t)g_height);
-        if (!g_dirty_spans) return;
-        g_prev_frame_valid = false; // Force a full screen write next loop
-    }
-
-    for (int y = 0; y < g_height; y++) {
-        g_dirty_spans[y].dirty = false;
-        g_dirty_spans[y].min_x = g_width;
-        g_dirty_spans[y].max_x = 0;
-
-        if (!g_prev_frame_valid) {
-            g_dirty_spans[y].min_x = 0;
-            g_dirty_spans[y].max_x = g_width - 1;
-            g_dirty_spans[y].dirty = true;
-            continue;
-        }
-
-        if (g_bpp == 16) {
-            uint16_t *row_now = g_native16 + ((size_t)y * (size_t)g_width);
-            uint16_t *row_prev = g_prev_native16 + ((size_t)y * (size_t)g_width);
-
-            if (memcmp(row_now, row_prev, (size_t)g_width * sizeof(uint16_t)) == 0) {
-                continue;
-            }
-
-            for (int x = 0; x < g_width; x++) {
-                if (row_now[x] != row_prev[x]) {
-                    g_dirty_spans[y].min_x = x;
-                    g_dirty_spans[y].dirty = true;
-                    break;
-                }
-            }
-
-            if (g_dirty_spans[y].dirty) {
-                for (int x = g_width - 1; x >= g_dirty_spans[y].min_x; x--) {
-                    if (row_now[x] != row_prev[x]) {
-                        g_dirty_spans[y].max_x = x;
-                        break;
-                    }
-                }
-            }
-        } else {
-            uint32_t *row_now = g_native + ((size_t)y * (size_t)g_width);
-            uint32_t *row_prev = g_prev_native + ((size_t)y * (size_t)g_width);
-
-            if (memcmp(row_now, row_prev, (size_t)g_width * sizeof(uint32_t)) == 0) {
-                continue;
-            }
-
-            for (int x = 0; x < g_width; x++) {
-                if (row_now[x] != row_prev[x]) {
-                    g_dirty_spans[y].min_x = x;
-                    g_dirty_spans[y].dirty = true;
-                    break;
-                }
-            }
-
-            if (g_dirty_spans[y].dirty) {
-                for (int x = g_width - 1; x >= g_dirty_spans[y].min_x; x--) {
-                    if (row_now[x] != row_prev[x]) {
-                        g_dirty_spans[y].max_x = x;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    for (int y = 0; y < g_height; y++) {
-        if (!g_dirty_spans[y].dirty) continue;
-        write_native_span_to_fb(y, g_dirty_spans[y].min_x, g_dirty_spans[y].max_x);
-        wrote_any = true;
-    }
-
-    if (wrote_any && g_fb_map_bytes > 0) {
-        (void)msync(g_fb_mem, g_fb_map_bytes, MS_ASYNC);
-    }
-
-    size_t total_pixels = (size_t)g_width * (size_t)g_height;
-    if (g_bpp == 16 && g_prev_native16 && g_native16) {
-        memcpy(g_prev_native16, g_native16, total_pixels * sizeof(uint16_t));
-    } else if (g_prev_native && g_native) {
-        memcpy(g_prev_native, g_native, total_pixels * sizeof(uint32_t));
-    }
-    g_prev_frame_valid = true;
-}
-
-static void hide_console_cursor(bool hide) {
-    int fd = open("/sys/class/graphics/fbcon/cursor_blink", O_WRONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        (void)write(fd, hide ? "0\n" : "1\n", 2);
-        close(fd);
-    }
-
-    const char *ttys[] = {"/dev/tty0", "/dev/tty1", "/dev/tty2"};
-    for (size_t i = 0; i < sizeof(ttys) / sizeof(ttys[0]); i++) {
-        int tty_fd = open(ttys[i], O_WRONLY | O_CLOEXEC);
-        if (tty_fd >= 0) {
-            (void)write(tty_fd, hide ? "\033[?25l" : "\033[?25h", 6);
-            close(tty_fd);
-        }
-    }
-}
-
-// ---------------- UI ----------------
-
-
-static bool volume_overlay_is_active(double now) {
-    if (!g_status_volume_seen) return false;
-    if (g_volume_overlay_last_change_at < 0.0) return false;
-    if (g_cfg_wait_timeout_seconds <= 0.0) return false;
-
-    double overlay_timeout = g_cfg_wait_timeout_seconds * 0.5;
-    if (overlay_timeout < 1.0) overlay_timeout = 1.0;
-    if (overlay_timeout > 4.0) overlay_timeout = 4.0;
-
-    return (now - g_volume_overlay_last_change_at) < overlay_timeout;
-}
-
-static void dim_rgb_frame(uint8_t percent) {
-    if (!g_img) return;
-
-    if (percent > 100) percent = 100;
-
-    size_t total_bytes = (size_t)g_width * (size_t)g_height * 3u;
-    for (size_t i = 0; i < total_bytes; i++) {
-        g_img[i] = (uint8_t)(((unsigned int)g_img[i] * (unsigned int)percent) / 100u);
-    }
-}
-
-
-static void draw_alpha_circle_to_image(int cx, int cy, int radius, uint32_t color, uint8_t max_alpha) {
-    if (!g_img || radius <= 0 || max_alpha == 0) return;
-
-    int r2 = radius * radius;
-    int x0 = clamp_int(cx - radius, 0, g_width - 1);
-    int x1 = clamp_int(cx + radius, 0, g_width - 1);
-    int y0 = clamp_int(cy - radius, 0, g_height - 1);
-    int y1 = clamp_int(cy + radius, 0, g_height - 1);
-
-    uint8_t r = (uint8_t)((color >> 16) & 0xFF);
-    uint8_t g = (uint8_t)((color >> 8) & 0xFF);
-    uint8_t b = (uint8_t)(color & 0xFF);
-
-    for (int y = y0; y <= y1; y++) {
-        int dy = y - cy;
-        for (int x = x0; x <= x1; x++) {
-            int dx = x - cx;
-            int d2 = (dx * dx) + (dy * dy);
-            if (d2 > r2) continue;
-
-            uint32_t falloff = (uint32_t)(r2 - d2);
-            uint8_t alpha = (uint8_t)(((uint64_t)max_alpha * falloff * falloff) / ((uint64_t)r2 * (uint64_t)r2));
-            if (alpha == 0) continue;
-
-            size_t idx = ((size_t)y * (size_t)g_width + (size_t)x) * 3;
-            blend_alpha_rgb(&g_img[idx], r, g, b, alpha);
-        }
-    }
-}
-
-static void draw_pulsing_album_art_placeholder(int target_x, int target_y, int target_w, int target_h, double now) {
-    if (target_w <= 0 || target_h <= 0) return;
-
-    int cx = target_x + (target_w / 2);
-    int cy = target_y + (target_h / 2);
-    int base = min_int(target_w, target_h);
-
-    double pulse = (sin(now * 2.2) + 1.0) * 0.5;
-    int glow_r = (base * 30) / 100 + (int)(pulse * (double)((base * 8) / 100));
-    int ring_r = (base * 15) / 100 + (int)(pulse * (double)((base * 4) / 100));
-    int core_r = max_int(3, (base * 5) / 100);
-
-    uint8_t glow_a = (uint8_t)(34 + (pulse * 34.0));
-    uint8_t ring_a = (uint8_t)(105 + (pulse * 95.0));
-    uint8_t core_a = (uint8_t)(145 + (pulse * 70.0));
-
-    draw_alpha_circle_to_image(cx, cy, glow_r, 0x00A3D5, glow_a);
-    draw_alpha_circle_to_image(cx, cy, ring_r, 0x00A3D5, ring_a);
-    draw_alpha_circle_to_image(cx, cy, core_r, 0xFFFFFF, core_a);
-}
-
-static bool draw_volume_overlay_if_needed(double now) {
-    if (!volume_overlay_is_active(now)) return false;
-
-    dim_rgb_frame(VOLUME_OVERLAY_DIM_PERCENT);
-
-    double overlay_timeout = g_cfg_wait_timeout_seconds * 0.5;
-    if (overlay_timeout < 1.0) overlay_timeout = 1.0;
-    if (overlay_timeout > 4.0) overlay_timeout = 4.0;
-
-    double elapsed = now - g_volume_overlay_last_change_at;
-    double anim_seconds = 0.35;
-    if (overlay_timeout > 0.0 && anim_seconds > overlay_timeout) anim_seconds = overlay_timeout;
-
-    float t = 1.0f;
-    if (anim_seconds > 0.0 && elapsed < anim_seconds) {
-        t = (float)(elapsed / anim_seconds);
-        if (t < 0.0f) t = 0.0f;
-        if (t > 1.0f) t = 1.0f;
-        t = t * t * (3.0f - (2.0f * t));
-    }
-
-    int start_vol = g_volume_overlay_start_volume >= 0 ? g_volume_overlay_start_volume : g_status_volume;
-    int vol = lerp_int_simple(clamp_int(start_vol, 0, 100), clamp_int(g_status_volume, 0, 100), t);
-
-    int margin = scale_x(28);
-    int bar_w = scale_x(34);
-    int bar_h = g_height - scale_y(76);
-
-    if (bar_w < 12) bar_w = 12;
-    if (bar_h < 80) bar_h = g_height - scale_y(32);
-    if (bar_h > g_height - scale_y(32)) bar_h = g_height - scale_y(32);
-
-    int x = g_width - margin - bar_w;
-    int y = (g_height - bar_h) / 2;
-
-    if (x < scale_x(8)) x = g_width - bar_w - scale_x(8);
-    if (y < scale_y(8)) y = scale_y(8);
-
-    draw_fill_rect(x, y, bar_w, bar_h, VOLUME_BAR_BG);
-
-    int inner_pad = scale_x(5);
-    if (inner_pad < 3) inner_pad = 3;
-
-    int inner_x = x + inner_pad;
-    int inner_y = y + inner_pad;
-    int inner_w = bar_w - (inner_pad * 2);
-    int inner_h = bar_h - (inner_pad * 2);
-
-    if (inner_w < 4) inner_w = bar_w;
-    if (inner_h < 4) inner_h = bar_h;
-
-    int fill_h = (int)(((double)vol / 100.0) * (double)inner_h);
-    fill_h = clamp_int(fill_h, 0, inner_h);
-
-    if (fill_h > 0) {
-        int fill_y = inner_y + inner_h - fill_h;
-        draw_fill_rect(inner_x, fill_y, inner_w, fill_h, TEXT_COLOR_MAIN);
-    }
-
-    int font_size = scale_font(18);
-    if (font_size < 10) font_size = 10;
-
-    char vol_txt[16];
-    snprintf(vol_txt, sizeof(vol_txt), "%d", vol);
-
-    FT_Set_Pixel_Sizes(g_font_bold, 0, (FT_UInt)font_size);
-    int text_w = calculate_text_width(g_font_bold, vol_txt);
-    int text_x = x + ((bar_w - text_w) / 2);
-    int text_y = y + bar_h + scale_y(22);
-
-    if (text_y < g_height - scale_y(4)) {
-        draw_text(g_font_bold, vol_txt, text_x, text_y, TEXT_COLOR_MAIN);
-    }
-
-    return true;
-}
-
-static void draw_waveform_column_alpha(int x, int y0, int y1, uint32_t color, uint8_t alpha) {
-    if (!g_img || alpha == 0 || x < 0 || x >= g_width) return;
-
-    if (y0 > y1) {
-        int tmp = y0;
-        y0 = y1;
-        y1 = tmp;
-    }
-
-    y0 = clamp_int(y0, 0, g_height - 1);
-    y1 = clamp_int(y1, 0, g_height - 1);
-    if (y1 < y0) return;
-
-    uint8_t r = (uint8_t)((color >> 16) & 0xFF);
-    uint8_t g = (uint8_t)((color >> 8) & 0xFF);
-    uint8_t b = (uint8_t)(color & 0xFF);
-
-    for (int y = y0; y <= y1; y++) {
-        size_t idx = ((size_t)y * (size_t)g_width + (size_t)x) * 3;
-        blend_alpha_rgb(&g_img[idx], r, g, b, alpha);
-    }
-}
-
-static void draw_synthetic_waveform(int target_x, int target_y, int w, int h, double now) {
-    if (strcmp(g_status_state, "play") != 0) return;
-    if (!g_img || w <= 0 || h <= 0) return;
-
-    int x0 = clamp_int(target_x, 0, g_width);
-    int x1 = clamp_int(target_x + w, 0, g_width);
-    int y0 = clamp_int(target_y, 0, g_height);
-    int y1 = clamp_int(target_y + h, 0, g_height);
-
-    if (x1 <= x0 || y1 <= y0) return;
-
-    int draw_w = x1 - x0;
-    int draw_h = y1 - y0;
-    int half_h = draw_h / 2;
-    if (half_h < 2) return;
-
-    int center_y = y0 + half_h;
-
-    // Synthetic only: no ALSA, no threads, no extra dependencies.
-    // Seek anchors the shape to playback position; monotonic time keeps it fluid
-    // between Volumio state polls.
-    float phase = ((float)g_status_seek * 0.035f) + ((float)now * 2.8f);
-
-    for (int x = 0; x < draw_w; x++) {
-        float xf = (float)x;
-
-        float val =
-            sinf((xf * 0.055f) + phase) * 0.45f +
-            cosf((xf * 0.026f) - (phase * 0.72f)) * 0.35f +
-            sinf((xf * 0.013f) + (phase * 1.37f)) * 0.20f;
-
-        if (val < 0.0f) val = -val;
-
-        // Keep it decorative. The progress bar remains the useful signal.
-        int bar_h = (int)(val * (float)half_h * 0.72f);
-        if (bar_h < 1) bar_h = 1;
-        if (bar_h > half_h) bar_h = half_h;
-
-        // Gentle centre emphasis so it reads as a waveform without overpowering text.
-        uint8_t alpha = (uint8_t)(34 + (bar_h * 42) / half_h);
-        draw_waveform_column_alpha(x0 + x, center_y - bar_h, center_y + bar_h, 0xFFFFFF, alpha);
-    }
-}
-
-static bool draw_clock(bool *out_needs_scroll, bool *out_layout_animating, bool *out_force_full_redraw) {
-    *out_needs_scroll = false;
-    *out_layout_animating = false;
-    *out_force_full_redraw = false;
-
-    time_t now = time(NULL);
-    struct tm now_tm;
-    localtime_r(&now, &now_tm);
-    double frame_now = monotonic_seconds();
-
-    bool show_metadata = state_shows_metadata();
-    bool is_playing = (strcmp(g_status_state, "play") == 0);
-
-    static float s_anim_progress = 0.0f;
-
-    if (show_metadata) {
-        if (s_anim_progress < 1.0f) {
-            s_anim_progress += 0.08f;
-            if (s_anim_progress > 1.0f) s_anim_progress = 1.0f;
-            *out_layout_animating = true;
-        }
-    } else {
-        if (s_anim_progress > 0.0f) {
-            s_anim_progress -= 0.08f;
-            if (s_anim_progress < 0.0f) s_anim_progress = 0.0f;
-            *out_layout_animating = true;
-        }
-    }
-
-    // Idle safety redraw: once per displayed minute, force the next framebuffer
-    // flush to rewrite the whole screen. This keeps the idle clock simple and
-    // clears any stray console/framebuffer noise without touching active playback.
-    static int s_last_idle_minute_key = -1;
-    bool fully_idle = (!show_metadata && s_anim_progress <= 0.01f);
-    int idle_minute_key = (now_tm.tm_yday * 24 * 60) + (now_tm.tm_hour * 60) + now_tm.tm_min;
-
-    if (fully_idle) {
-        if (s_last_idle_minute_key != idle_minute_key) {
-            *out_force_full_redraw = true;
-            s_last_idle_minute_key = idle_minute_key;
-        }
-    } else {
-        s_last_idle_minute_key = -1;
-    }
-
-    if (show_metadata && s_anim_progress > 0.01f && album_background_allowed_now(frame_now)) {
-        draw_album_art_background_zoomed();
-    } else {
-        draw_fill_rect(0, 0, g_width, g_height, BG_COLOR);
-    }
-
-    char time_str[16];
-    if (g_cfg_clock_24h) {
-        strftime(time_str, sizeof(time_str), "%H:%M", &now_tm);
-    } else {
-        strftime(time_str, sizeof(time_str), "%I:%M", &now_tm);
-        if (time_str[0] == '0') memmove(time_str, time_str + 1, strlen(time_str));
-    }
-
-    // Smooth heartbeat colon for the large idle clock only.
-    // The colon keeps its measured width, but its glyph alpha fades through a sine table.
-    bool big_clock_heartbeat = (!show_metadata && s_anim_progress <= 0.01f);
-    g_last_big_clock_heartbeat = big_clock_heartbeat;
-    g_colon_fade_active = big_clock_heartbeat;
-    update_colon_fade_alpha(monotonic_seconds());
-
-    const int margin_x = scale_x(24);
-    const int margin_y = scale_y(20);
-    const int safe_bottom = scale_y(26);
-
-    const int idle_font = scale_font(130); // 10% larger than previous 110px design size
-    const int active_font = scale_font(70);
-    const int cur_font = lerp_int_simple(idle_font, active_font, s_anim_progress);
-
-    FT_Set_Pixel_Sizes(g_font_bold, 0, (FT_UInt)cur_font);
-    int clock_w = calculate_text_width(g_font_bold, time_str);
-
-    FT_Set_Pixel_Sizes(g_font_bold, 0, (FT_UInt)active_font);
-    int active_clock_top_offset = text_top_offset_from_baseline(g_font_bold, time_str);
-    FT_Set_Pixel_Sizes(g_font_bold, 0, (FT_UInt)cur_font);
-
-    int idle_clock_x = (g_width - clock_w) / 2;
-    int idle_clock_y = (g_height / 2) + (cur_font / 3);
-
-    int art_size = scale_font(220);
-    int max_art_by_height = g_height - scale_y(100);
-    int max_art_by_width = (g_width / 2) - scale_x(20);
-
-    if (art_size > max_art_by_height) art_size = max_art_by_height;
-    if (art_size > max_art_by_width) art_size = max_art_by_width;
-    if (art_size < scale_font(90)) art_size = scale_font(90);
-    art_size = clamp_int(art_size, 40, min_int(g_width - scale_x(40), g_height - scale_y(80)));
-
-    int art_target_x = margin_x;
-    int art_target_y = margin_y + scale_y(10);
-    int art_start_x = -(art_size + margin_x);
-    int cur_art_x = lerp_int_simple(art_start_x, art_target_x, s_anim_progress);
-
-    int text_gap = scale_x(20);
-    int text_block_x = art_target_x + art_size + text_gap;
-    int text_right = g_width - margin_x;
-
-    if (text_block_x > g_width - scale_x(80)) text_block_x = margin_x;
-
-    int active_clock_center_x = text_block_x + ((text_right - text_block_x) / 2);
-    int active_clock_x = active_clock_center_x - (clock_w / 2);
-
-    int active_clock_y = art_target_y - active_clock_top_offset;
-
-    int cur_clock_x = lerp_int_simple(idle_clock_x, active_clock_x, s_anim_progress);
-    int cur_clock_y = lerp_int_simple(idle_clock_y, active_clock_y, s_anim_progress);
-
-    if (show_metadata && s_anim_progress > 0.01f && g_art_rgba && !g_art_is_default_fallback) {
-        int clock_pad_x = scale_x(18);
-        int clock_pad_y = scale_y(14);
-        dim_rect_rgb_percent(cur_clock_x - clock_pad_x,
-                             cur_clock_y - cur_font - clock_pad_y,
-                             clock_w + (clock_pad_x * 2),
-                             cur_font + (clock_pad_y * 2),
-                             58);
-    }
-
-    if (big_clock_heartbeat) {
-        char *colon = strchr(time_str, ':');
-
-        if (colon) {
-            char hour_part[16];
-            char minute_part[16];
-            size_t hour_len = (size_t)(colon - time_str);
-
-            if (hour_len >= sizeof(hour_part)) hour_len = sizeof(hour_part) - 1;
-            memcpy(hour_part, time_str, hour_len);
-            hour_part[hour_len] = '\0';
-            snprintf(minute_part, sizeof(minute_part), "%s", colon + 1);
-
-            int hour_w = calculate_text_width(g_font_bold, hour_part);
-            int colon_w = calculate_text_width(g_font_bold, ":");
-            int colon_x = cur_clock_x + hour_w;
-            int minute_x = colon_x + colon_w;
-
-            draw_text(g_font_bold, hour_part, cur_clock_x, cur_clock_y, TEXT_COLOR_MAIN);
-            draw_text_alpha(g_font_bold, ":", colon_x, cur_clock_y, TEXT_COLOR_MAIN, g_colon_alpha);
-            draw_text(g_font_bold, minute_part, minute_x, cur_clock_y, TEXT_COLOR_MAIN);
-        } else {
-            draw_text(g_font_bold, time_str, cur_clock_x, cur_clock_y, TEXT_COLOR_MAIN);
-        }
-
-        static char date_str[64] = "";
-        static char ip_value[64] = "No IP";
-        static char temp_str[32] = "CPU: N/A";
-        static bool cpu_temp_hot = false;
-        static int cached_yday = -1;
-        static double last_ip_refresh = -1000.0;
-        static double last_temp_refresh = -1000.0;
-
-        double idle_now = monotonic_seconds();
-
-        if (cached_yday != now_tm.tm_yday || date_str[0] == '\0') {
-            format_idle_date(date_str, sizeof(date_str), &now_tm);
-            cached_yday = now_tm.tm_yday;
-        }
-
-        if (idle_now - last_ip_refresh >= 60.0 || ip_value[0] == '\0') {
-            get_primary_ipv4(ip_value, sizeof(ip_value));
-            last_ip_refresh = idle_now;
-        }
-
-        if (idle_now - last_temp_refresh >= 5.0 || temp_str[0] == '\0') {
-            cpu_temp_hot = format_cpu_temp_text(temp_str, sizeof(temp_str));
-            last_temp_refresh = idle_now;
-        }
-
-        char ip_str[96];
-        snprintf(ip_str, sizeof(ip_str), "IP: %s  ", ip_value);
-
-        FT_Set_Pixel_Sizes(g_font_reg, 0, (FT_UInt)scale_font(22));
-        draw_text_centered(g_font_reg, date_str,
-                           margin_x, g_width - margin_x,
-                           scale_y(44), TEXT_COLOR_DIM);
-
-        FT_Set_Pixel_Sizes(g_font_reg, 0, (FT_UInt)scale_font(16));
-        int ip_w = calculate_text_width(g_font_reg, ip_str);
-        int temp_w = calculate_text_width(g_font_reg, temp_str);
-        int bottom_text_x = margin_x + ((g_width - (margin_x * 2) - ip_w - temp_w) / 2);
-        int bottom_text_y = g_height - scale_y(28);
-        draw_text(g_font_reg, ip_str, bottom_text_x, bottom_text_y, 0x666666);
-        draw_text(g_font_reg, temp_str, bottom_text_x + ip_w, bottom_text_y,
-                  cpu_temp_hot ? 0xFF0000 : 0x666666);
-    } else {
-        draw_text(g_font_bold, time_str, cur_clock_x, cur_clock_y, TEXT_COLOR_MAIN);
-    }
-
-    if (s_anim_progress > 0.01f) {
-        int title_size = scale_font(26);
-        int artist_size = scale_font(20);
-        int small_size = scale_font(16);
-
-        if (g_art_rgba) {
-            draw_album_art_cached(cur_art_x, art_target_y, art_size, art_size);
-        } else if (g_art_is_default_fallback && g_art_is_pulse_fallback) {
-            draw_pulsing_album_art_placeholder(cur_art_x, art_target_y, art_size, art_size, monotonic_seconds());
-            *out_layout_animating = true;
-        } else {
-            draw_fill_rect(cur_art_x, art_target_y, art_size, art_size, PROGRESS_BAR_BG);
-            FT_Set_Pixel_Sizes(g_font_reg, 0, (FT_UInt)small_size);
-            draw_text_centered(g_font_reg, "No Art", cur_art_x, cur_art_x + art_size,
-                               art_target_y + (art_size / 2), TEXT_COLOR_DIM);
-        }
-
-        int title_y = art_target_y + scale_y(105);
-        int artist_y = title_y + scale_y(40);
-        int album_y = artist_y + scale_y(40);
-
-        FT_Set_Pixel_Sizes(g_font_bold, 0, (FT_UInt)title_size);
-        int max_text_w = text_right - text_block_x;
-        if (max_text_w < scale_x(80)) max_text_w = g_width - (margin_x * 2);
-
-        int title_w = calculate_text_width(g_font_bold, g_status_title);
-
-        if (title_w > max_text_w) {
-            *out_needs_scroll = is_playing;
-
-            static double s_scroll_start = 0.0;
-            static char s_last_scroll_title[256] = "";
-
-            if (strcmp(s_last_scroll_title, g_status_title) != 0) {
-                snprintf(s_last_scroll_title, sizeof(s_last_scroll_title), "%s", g_status_title);
-                s_scroll_start = monotonic_seconds();
-            }
-
-            if (is_playing) {
-                int scroll_gap = scale_x(80);
-                if (scroll_gap < 32) scroll_gap = 32;
-
-                int clip_x0 = text_block_x;
-                int clip_y0 = title_y - scale_y(34);
-                int clip_x1 = text_right;
-                int clip_y1 = title_y + scale_y(12);
-                int clip_w = clip_x1 - clip_x0;
-                int clip_h = clip_y1 - clip_y0;
-                int baseline_in_strip = title_y - clip_y0;
-
-                bool strip_ok = ensure_scroll_strip(g_font_bold, g_status_title, title_size,
-                                                    clip_w, clip_h, baseline_in_strip,
-                                                    scroll_gap, TEXT_COLOR_MAIN, title_w);
-
-                double elapsed = strip_ok ? (monotonic_seconds() - g_scroll_strip_started_at)
-                                         : (monotonic_seconds() - s_scroll_start);
-                int cycle_w = strip_ok ? g_scroll_strip_cycle_w : (title_w + scroll_gap);
-                int offset = 0;
-
-                if (cycle_w > 0) {
-                    offset = (int)fmod(elapsed * (double)scale_x(30), (double)cycle_w);
-                }
-
-                if (strip_ok) {
-                    draw_scroll_strip_window(clip_x0, clip_y0, clip_w, clip_h, offset);
-                } else {
-                    int first_x = text_block_x - offset;
-                    int second_x = first_x + cycle_w;
-
-                    draw_text_clipped(g_font_bold, g_status_title, first_x, title_y,
-                                      text_block_x, title_y - scale_y(34), text_right, title_y + scale_y(12),
-                                      TEXT_COLOR_MAIN);
-
-                    draw_text_clipped(g_font_bold, g_status_title, second_x, title_y,
-                                      text_block_x, title_y - scale_y(34), text_right, title_y + scale_y(12),
-                                      TEXT_COLOR_MAIN);
-                }
-            } else {
-                draw_text_clipped(g_font_bold, g_status_title, text_block_x, title_y,
-                                  text_block_x, title_y - scale_y(34), text_right, title_y + scale_y(12),
-                                  TEXT_COLOR_MAIN);
-            }
-        } else {
-            draw_text_clipped(g_font_bold, g_status_title, text_block_x, title_y,
-                              text_block_x, title_y - scale_y(34), text_right, title_y + scale_y(12),
-                              TEXT_COLOR_MAIN);
-        }
-
-        FT_Set_Pixel_Sizes(g_font_reg, 0, (FT_UInt)artist_size);
-        draw_text_clipped(g_font_reg, g_status_artist, text_block_x, artist_y,
-                          text_block_x, artist_y - scale_y(28), text_right, artist_y + scale_y(10),
-                          TEXT_COLOR_DIM);
-        draw_text_clipped(g_font_reg, g_status_album, text_block_x, album_y,
-                          text_block_x, album_y - scale_y(28), text_right, album_y + scale_y(10),
-                          TEXT_COLOR_DIM);
-
-        int pb_x = margin_x;
-        int pb_w = g_width - (margin_x * 2);
-        int pb_h = scale_y(8);
-        if (pb_h < 3) pb_h = 3;
-
-        int progress_font = scale_font(11);
-        if (progress_font < 8) progress_font = 8;
-
-        int pb_y = g_height - safe_bottom - scale_y(30);
-        if (pb_y < album_y + scale_y(16)) pb_y = album_y + scale_y(16);
-        if (pb_y + pb_h + scale_y(18) > g_height) pb_y = g_height - scale_y(28);
-
-        if (is_playing) {
-            int wave_h = scale_y(36);
-            if (wave_h < 14) wave_h = 14;
-            int wave_y = pb_y - ((wave_h - pb_h) / 2);
-            draw_synthetic_waveform(pb_x, wave_y, pb_w, wave_h, frame_now);
-            *out_layout_animating = true;
-        }
-
-        draw_fill_rect(pb_x, pb_y, pb_w, pb_h, PROGRESS_BAR_BG);
-
-        if (g_status_duration > 0) {
-            int seek = clamp_int(g_status_seek, 0, g_status_duration);
-            int fill_w = (int)(((double)seek / (double)g_status_duration) * (double)pb_w);
-            fill_w = clamp_int(fill_w, 0, pb_w);
-            if (fill_w > 0) draw_fill_rect(pb_x, pb_y, fill_w, pb_h, PROGRESS_BAR_FG);
-
-            char elapsed_txt[32];
-            char duration_txt[32];
-            format_duration_text(elapsed_txt, sizeof(elapsed_txt), seek);
-            format_duration_text(duration_txt, sizeof(duration_txt), g_status_duration);
-
-            FT_Set_Pixel_Sizes(g_font_reg, 0, (FT_UInt)progress_font);
-
-            int time_y = pb_y + pb_h + scale_y(14);
-            if (time_y > g_height - scale_y(4)) time_y = g_height - scale_y(4);
-
-            draw_text(g_font_reg, elapsed_txt, pb_x, time_y, TEXT_COLOR_DIM);
-
-            int duration_w = calculate_text_width(g_font_reg, duration_txt);
-            draw_text(g_font_reg, duration_txt, pb_x + pb_w - duration_w, time_y, TEXT_COLOR_DIM);
-
-            char audio_format_txt[192];
-            build_audio_format_text(audio_format_txt, sizeof(audio_format_txt));
-            if (audio_format_txt[0]) {
-                int left_time_w = calculate_text_width(g_font_reg, elapsed_txt);
-                int center_left = pb_x + left_time_w + scale_x(12);
-                int center_right = pb_x + pb_w - duration_w - scale_x(12);
-
-                if (center_right > center_left + scale_x(40)) {
-                    draw_text_centered(g_font_reg, audio_format_txt, center_left, center_right,
-                                       time_y, TEXT_COLOR_DIM);
-                }
-            }
-        }
-    }
-
-    if (draw_volume_overlay_if_needed(monotonic_seconds())) {
-        *out_layout_animating = true;
-    }
-
-    return is_playing;
-}
-
-// ---------------- Init / Cleanup ----------------
-
-static bool allocate_surfaces(void) {
-    size_t pixels = (size_t)g_width * (size_t)g_height;
-
-    g_img = malloc(pixels * 3);
-    g_native = malloc(pixels * sizeof(uint32_t));
-    g_prev_native = calloc(pixels, sizeof(uint32_t));
-
-    if (g_bpp == 16) {
-        g_native16 = malloc(pixels * sizeof(uint16_t));
-        g_prev_native16 = calloc(pixels, sizeof(uint16_t));
-    }
-
-    if (!g_img || !g_native || !g_prev_native || (g_bpp == 16 && (!g_native16 || !g_prev_native16))) {
-        fprintf(stderr, "[Memory Error] Failed to allocate render buffers for %dx%d.\n", g_width, g_height);
-        DBG_LOG("Render buffer allocation failed for %dx%d", g_width, g_height);
-        return false;
-    }
-
-    return true;
-}
-
-static bool init_all(void) {
-    load_json_config();
-    debug_log_open();
-
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-        fprintf(stderr, "[Curl Error] curl_global_init failed.\n");
-        DBG_LOG("curl_global_init failed");
-        return false;
-    }
-    DBG_LOG("Startup: build=%s config=%s fb_path=%s debug=%s log_path=%s max_bytes=%ld",
-            VOLUMIO_FBD_BUILD_ID, CONFIG_PATH, g_cfg_fb_path, g_cfg_debug_enabled ? "true" : "false",
-            g_cfg_debug_log_path, g_cfg_debug_log_max_bytes);
-    DBG_LOG("Volumio config: wait_timeout=%.2f album_art_delay=%.2f album_art_recheck=%.2f", g_cfg_wait_timeout_seconds, g_cfg_album_art_lookup_delay_seconds, g_cfg_album_art_recheck_seconds);
-
-    if (FT_Init_FreeType(&g_ft) != 0) {
-        fprintf(stderr, "[Font Error] FreeType init failed.\n");
-        return false;
-    }
-
-    if (FT_New_Face(g_ft, FONT_BOLD, 0, &g_font_bold) != 0) {
-        fprintf(stderr, "[Font Error] Missing bold font: %s\n", FONT_BOLD);
-        return false;
-    }
-
-    if (FT_New_Face(g_ft, FONT_REG, 0, &g_font_reg) != 0) {
-        fprintf(stderr, "[Font Error] Missing regular font: %s\n", FONT_REG);
-        return false;
-    }
-
-    if (!open_framebuffer()) return false;
-    if (!allocate_surfaces()) return false;
-    warm_common_font_atlases();
-
-    return true;
-}
-
-static void cleanup_all(void) {
-    DBG_LOG("Shutdown requested");
-    close_http_keepalive();
-
-    if (g_art_rgba) {
-        stbi_image_free(g_art_rgba);
-        g_art_rgba = NULL;
-    }
-    
-    free_scaled_art();
-    free(g_album_bg_rgb);
-    g_album_bg_rgb = NULL;
-    g_album_bg_w = 0;
-    g_album_bg_h = 0;
+static void cleanup(void) {
+    clear_art();
+    free(g_bg_rgb);
     free_scroll_strip();
-
-    free(g_http_buffer);
-    g_http_buffer = NULL;
-
+    for (int i = 0; i < GLYPH_CACHE_SLOTS; i++) free(g_glyph_cache[i].alpha);
+    if (g_curl) curl_easy_cleanup(g_curl);
+    if (g_font_bold) FT_Done_Face(g_font_bold);
+    if (g_font_reg) FT_Done_Face(g_font_reg);
+    if (g_ft) FT_Done_FreeType(g_ft);
+    if (g_fb) munmap(g_fb, g_fb_bytes);
+    if (g_fb_fd >= 0) close(g_fb_fd);
     free(g_img);
-    g_img = NULL;
-
-    free(g_native);
-    g_native = NULL;
-
-    free(g_prev_native);
-    g_prev_native = NULL;
-
-    free(g_native16);
-    g_native16 = NULL;
-
-    free(g_prev_native16);
-    g_prev_native16 = NULL;
-
+    free(g_prev_img);
     free(g_dirty_spans);
-    g_dirty_spans = NULL;
-
-    free_font_atlases();
-
-    if (g_font_bold) {
-        FT_Done_Face(g_font_bold);
-        g_font_bold = NULL;
-    }
-
-    if (g_font_reg) {
-        FT_Done_Face(g_font_reg);
-        g_font_reg = NULL;
-    }
-
-    if (g_ft) {
-        FT_Done_FreeType(g_ft);
-        g_ft = NULL;
-    }
-
-    hide_console_cursor(false);
-    close_framebuffer();
-    curl_global_cleanup();
-    DBG_LOG("Shutdown complete");
-    debug_log_close();
-}
-
-static void on_signal(int sig) {
-    (void)sig;
-    g_running = 0;
-}
-
-static void install_signal_handlers(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_signal;
-    sigemptyset(&sa.sa_mask);
-
-    // Do not use SA_RESTART. Poll/recv/send should return on SIGINT/SIGTERM.
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
 }
 
 int main(void) {
-    install_signal_handlers();
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    load_config();
+    memset(&g_state, 0, sizeof(g_state));
+    safe_copy(g_state.state, sizeof(g_state.state), "stop");
+    safe_copy(g_state.service, sizeof(g_state.service), "mpd");
 
-    if (!init_all()) {
-        cleanup_all();
-        return 1;
-    }
-
-    hide_console_cursor(true);
-    blank_physical_framebuffer(BG_COLOR);
-    DBG_LOG("Initial framebuffer setup complete");
-
-    double target_fps = HARDWARE_FPS_STATIC;
-    double target_interval = 1.0 / target_fps;
-    double next_frame_deadline = monotonic_seconds();
+    if (!fb_init()) return 1;
+    if (!fonts_init()) return 1;
 
     while (g_running) {
-        bool needs_scroll = false;
-        bool layout_animating = false;
-        bool force_full_redraw = false;
+        double n = now_seconds();
+        if (n - g_last_volumio_fetch >= 0.50) {
+            fetch_volumio(&g_state);
+            g_last_volumio_fetch = n;
+        }
+        if (n - g_last_alsa_fetch >= 0.20) {
+            read_alsa(&g_audio);
+            g_last_alsa_fetch = n;
+        }
 
-        // Priority path: poll Volumio and service artwork lookup before any
-        // decorative rendering work. The zoomed background is cosmetic and must
-        // never delay track/art state updates.
-        update_volumio_state();
+        update_volume_overlay(&g_state, n);
 
-        bool is_playing = draw_clock(&needs_scroll, &layout_animating, &force_full_redraw);
-
-        if (layout_animating || g_colon_fade_active || (needs_scroll && is_playing)) {
-            // Full-rate only when something on screen actually benefits from it.
-            target_fps = HARDWARE_FPS_SCROLLING;
-        } else if (is_playing) {
-            target_fps = HARDWARE_FPS_PLAYING;
+        bool real_idle = is_real_idle(&g_state);
+        bool clock_mode = false;
+        if (real_idle) {
+            g_audio_stopped_at = -1.0;
+            clock_mode = true;
+        } else if (g_audio.running) {
+            g_audio_stopped_at = -1.0;
+            clock_mode = false;
         } else {
-            // Keep the old 1Hz behaviour when heartbeat-style idle refresh is active.
-            // Otherwise drop to a deep idle check window.
-            target_fps = g_last_big_clock_heartbeat ? HARDWARE_FPS_STATIC : HARDWARE_FPS_SLEEP;
+            if (g_audio_stopped_at < 0.0) g_audio_stopped_at = n;
+            clock_mode = (n - g_audio_stopped_at) >= g_cfg.return_to_clock_seconds;
         }
 
-        if (target_fps <= 0.0) target_fps = HARDWARE_FPS_STATIC;
-        target_interval = 1.0 / target_fps;
+        update_art_for_state(&g_state, clock_mode);
 
-        if (force_full_redraw) {
-            g_prev_frame_valid = false;
+        if (clock_mode) draw_idle(n);
+        else if (is_airplay(&g_state)) draw_airplay_screen(&g_state, &g_audio, n);
+        else if (is_spotify(&g_state)) draw_spotify_screen(&g_state, &g_audio, g_audio.running, n);
+        else draw_generic_screen(&g_state, &g_audio, g_audio.running, n);
+
+        draw_volume_overlay(n, clock_mode);
+
+        fb_flush();
+
+        bool scroll = false;
+        if (!clock_mode && !is_airplay(&g_state) && g_audio.running) {
+            int p = sx(g_cfg.ui.padding);
+            int art = sy(is_spotify(&g_state) ? g_cfg.ui.album_art_size : g_cfg.ui.generic_album_art_size);
+            int tx = p + art + p;
+            int tw = ui_text_width_from(tx);
+            scroll = text_width(g_font_bold, sf(g_cfg.ui.title_font_size), g_state.title) > tw;
         }
 
-        flush_native_to_fb();
-
-        next_frame_deadline += target_interval;
-        double loop_end_time = monotonic_seconds();
-
-        if (loop_end_time < next_frame_deadline) {
-            sleep_seconds(next_frame_deadline - loop_end_time);
-        } else {
-            // We fell behind. Reset pacing so the loop does not drift or stutter trying to catch up.
-            next_frame_deadline = loop_end_time;
-        }
+        bool animating = scroll || g_cfg.colon_alpha_enabled || volume_overlay_active(n);
+        double delay;
+        if (animating) delay = 1.0 / 30.0;
+        else if (!clock_mode || g_audio.running) delay = 1.0;
+        else delay = 5.0;
+        sleep_seconds(delay);
     }
 
-    cleanup_all();
+    cleanup();
+    curl_global_cleanup();
     return 0;
 }
