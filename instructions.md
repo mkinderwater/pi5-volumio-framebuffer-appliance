@@ -198,11 +198,14 @@ Wants=systemd-udev-settle.service network-online.target time-sync.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/fb0 ] && exit 0; sleep 1; done; echo "/dev/fb0 missing"; exit 1'
+ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
 ExecStart=/usr/local/bin/volumio_fbd
 Restart=always
 RestartSec=2
 User=root
+TimeoutStopSec=3
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
