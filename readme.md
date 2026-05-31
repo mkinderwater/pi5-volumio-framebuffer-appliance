@@ -419,7 +419,9 @@ Reload after editing:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl restart volumio_fbd.service
+sudo systemctl enable volumio-fbd
+sudo systemctl start volumio-fbd
+sudo systemctl status volumio-fbd
 ```
 
 ## What This Is
