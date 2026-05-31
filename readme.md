@@ -7,7 +7,8 @@ This assumes a fresh bare-metal Volumio install.
 No desktop.  
 No browser.  
 No X11.  
-No vendor LCD installer.
+No vendor LCD installer.  
+No full GitHub clone.
 
 Custom boot settings go here:
 
@@ -40,6 +41,9 @@ Reboot after changing LCD boot settings.
 Download the overlay:
 
 ```bash
+sudo apt update
+sudo apt install -y wget ca-certificates
+
 sudo mkdir -p /boot/overlays
 
 cd /tmp
@@ -92,13 +96,15 @@ Download the overlay:
 
 ```bash
 sudo apt update
-sudo apt install -y git
+sudo apt install -y wget ca-certificates
+
 sudo mkdir -p /boot/overlays
 
 cd /tmp
-git clone --depth 1 https://github.com/goodtft/LCD-show.git
+wget -O tft35a-overlay.dtb \
+https://raw.githubusercontent.com/goodtft/LCD-show/master/usr/tft35a-overlay.dtb
 
-sudo cp /tmp/LCD-show/usr/tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
+sudo cp tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
 ```
 
 Append the boot settings:
@@ -139,46 +145,17 @@ Reboot:
 sudo reboot
 ```
 
-## 2. Verify Framebuffer
-
-After reboot:
-
-```bash
-ls -l /dev/fb*
-cat /sys/class/graphics/fb0/name
-```
-
-Test `/dev/fb0` first:
-
-```bash
-sudo /usr/local/bin/volumio_fbd /dev/fb0
-```
-
-If needed, test `/dev/fb1`:
-
-```bash
-sudo /usr/local/bin/volumio_fbd /dev/fb1
-```
-
-Use whichever framebuffer works in the service.
-
-## 3. Install Display Program From GitHub
-
-Repository:
-
-```text
-https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance
-```
+## 2. Install Display Program From GitHub
 
 Install the compiled binary:
 
 ```bash
 sudo apt update
-sudo apt install -y git
+sudo apt install -y wget ca-certificates
 
-sudo git clone --depth 1 https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance.git /opt/pi5-volumio-framebuffer-appliance
+sudo wget -O /usr/local/bin/volumio_fbd \
+https://raw.githubusercontent.com/mkinderwater/pi5-volumio-framebuffer-appliance/main/lcd%20program/compiled/volumio_fbd
 
-sudo cp "/opt/pi5-volumio-framebuffer-appliance/lcd program/compiled/volumio_fbd" /usr/local/bin/volumio_fbd
 sudo chmod 755 /usr/local/bin/volumio_fbd
 ```
 
@@ -212,17 +189,42 @@ to:
 "fb_path": "/dev/fb1"
 ```
 
+## 3. Verify Framebuffer
+
+After reboot and binary install:
+
+```bash
+ls -l /dev/fb*
+cat /sys/class/graphics/fb0/name
+```
+
+Test `/dev/fb0` first:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb0
+```
+
+If needed, test `/dev/fb1`:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb1
+```
+
+Use whichever framebuffer works in the service.
+
 ## 4. Optional: Build From Source
 
 Use this only if you want to compile it on the Pi.
 
 ```bash
 sudo apt update
-sudo apt install -y git build-essential pkg-config libcurl4-openssl-dev libjson-c-dev libfreetype6-dev
+sudo apt install -y wget ca-certificates build-essential pkg-config libcurl4-openssl-dev libjson-c-dev libfreetype6-dev
 
-sudo git clone --depth 1 https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance.git /opt/pi5-volumio-framebuffer-appliance
+mkdir -p /tmp/volumio-fbd
+cd /tmp/volumio-fbd
 
-cd "/opt/pi5-volumio-framebuffer-appliance/lcd program/source"
+wget -O volumio_fbd.c \
+https://raw.githubusercontent.com/mkinderwater/pi5-volumio-framebuffer-appliance/main/lcd%20program/source/volumio_fbd.c
 
 gcc -Os -pipe -Wall -Wextra -pthread \
   -ffunction-sections -fdata-sections \
@@ -305,12 +307,10 @@ sudo systemctl restart volumio-fbd
 ```bash
 sudo systemctl stop volumio-fbd 2>/dev/null || true
 
-cd /opt/pi5-volumio-framebuffer-appliance
-sudo git pull --ff-only
+sudo wget -O /usr/local/bin/volumio_fbd \
+https://raw.githubusercontent.com/mkinderwater/pi5-volumio-framebuffer-appliance/main/lcd%20program/compiled/volumio_fbd
 
-sudo cp "lcd program/compiled/volumio_fbd" /usr/local/bin/volumio_fbd
 sudo chmod 755 /usr/local/bin/volumio_fbd
-
 sudo systemctl restart volumio-fbd
 ```
 
