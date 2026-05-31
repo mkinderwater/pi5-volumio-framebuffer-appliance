@@ -957,6 +957,11 @@ static bool fonts_init(void) {
     if (FT_Init_FreeType(&g_ft) != 0) return false;
     if (FT_New_Face(g_ft, FONT_BOLD, 0, &g_font_bold) != 0) return false;
     if (FT_New_Face(g_ft, FONT_REG, 0, &g_font_reg) != 0) return false;
+
+    /* Be explicit. Some fonts expose multiple charmaps. */
+    FT_Select_Charmap(g_font_bold, FT_ENCODING_UNICODE);
+    FT_Select_Charmap(g_font_reg, FT_ENCODING_UNICODE);
+
     return true;
 }
 
@@ -1014,21 +1019,77 @@ static GlyphCacheEntry *glyph_cache_get(FT_Face face, int px, unsigned int cp) {
     return glyph_cache_get(face, px, cp);
 }
 
+static unsigned int utf8_next_codepoint(const unsigned char **pp) {
+    const unsigned char *p = *pp;
+
+    if (!p || !*p) return 0;
+
+    if (p[0] < 0x80) {
+        *pp = p + 1;
+        return p[0];
+    }
+
+    if ((p[0] & 0xE0) == 0xC0 &&
+        (p[1] & 0xC0) == 0x80) {
+        unsigned int cp = ((unsigned int)(p[0] & 0x1F) << 6) |
+                          ((unsigned int)(p[1] & 0x3F));
+        *pp = p + 2;
+        return cp;
+    }
+
+    if ((p[0] & 0xF0) == 0xE0 &&
+        (p[1] & 0xC0) == 0x80 &&
+        (p[2] & 0xC0) == 0x80) {
+        unsigned int cp = ((unsigned int)(p[0] & 0x0F) << 12) |
+                          ((unsigned int)(p[1] & 0x3F) << 6) |
+                          ((unsigned int)(p[2] & 0x3F));
+        *pp = p + 3;
+        return cp;
+    }
+
+    if ((p[0] & 0xF8) == 0xF0 &&
+        (p[1] & 0xC0) == 0x80 &&
+        (p[2] & 0xC0) == 0x80 &&
+        (p[3] & 0xC0) == 0x80) {
+        unsigned int cp = ((unsigned int)(p[0] & 0x07) << 18) |
+                          ((unsigned int)(p[1] & 0x3F) << 12) |
+                          ((unsigned int)(p[2] & 0x3F) << 6) |
+                          ((unsigned int)(p[3] & 0x3F));
+        *pp = p + 4;
+        return cp;
+    }
+
+    /* Invalid byte. Advance so rendering never gets stuck. */
+    *pp = p + 1;
+    return '?';
+}
+
 static int text_width(FT_Face face, int px, const char *s) {
     if (!face || !s) return 0;
+
     int w = 0;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        GlyphCacheEntry *g = glyph_cache_get(face, px, *p);
+    const unsigned char *p = (const unsigned char *)s;
+
+    while (*p) {
+        unsigned int cp = utf8_next_codepoint(&p);
+        if (!cp) break;
+        GlyphCacheEntry *g = glyph_cache_get(face, px, cp);
         if (g) w += g->advance;
     }
+
     return w;
 }
 
 static void draw_text_clip(FT_Face face, int px, int x, int y, const char *s, uint32_t color, int alpha, int clip_x0, int clip_y0, int clip_x1, int clip_y1) {
     if (!face || !s || !*s || alpha <= 0) return;
+
     int pen_x = x;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        GlyphCacheEntry *g = glyph_cache_get(face, px, *p);
+    const unsigned char *p = (const unsigned char *)s;
+
+    while (*p) {
+        unsigned int cp = utf8_next_codepoint(&p);
+        if (!cp) break;
+        GlyphCacheEntry *g = glyph_cache_get(face, px, cp);
         if (!g) continue;
 
         int gx = pen_x + g->left;
@@ -1462,8 +1523,12 @@ static void free_scroll_strip(void) {
 
 static void strip_blend_glyph(uint8_t *strip, int sw, int sh, FT_Face face, int px, int x, int baseline, const char *text) {
     int pen_x = x;
-    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-        GlyphCacheEntry *g = glyph_cache_get(face, px, *p);
+    const unsigned char *p = (const unsigned char *)text;
+
+    while (*p) {
+        unsigned int cp = utf8_next_codepoint(&p);
+        if (!cp) break;
+        GlyphCacheEntry *g = glyph_cache_get(face, px, cp);
         if (!g) continue;
         int gx = pen_x + g->left;
         int gy = baseline - g->top;
