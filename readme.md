@@ -303,7 +303,7 @@ This does not overwrite your local settings.
 
 ## 7. JSON Settings
 
-The first run creates:
+The display program creates this file the first time it runs:
 
 ```text
 /etc/volumio_fbd_config.json
@@ -315,70 +315,481 @@ Edit it here:
 sudo nano /etc/volumio_fbd_config.json
 ```
 
-Common changes:
+Restart the service after changes:
 
-### Framebuffer
+```bash
+sudo systemctl restart volumio-fbd
+```
 
-Use `/dev/fb0` unless your LCD works on `/dev/fb1`.
+## Display Settings
+
+These control the framebuffer device, screen size, clock format, and how quickly the display returns to the clock screen.
+
+```json
+"display": {
+  "fb_path": "/dev/fb0",
+  "width": 480,
+  "height": 320,
+  "clock_type": "12h",
+  "return_to_clock_seconds": 5.0
+}
+```
+
+### `fb_path`
+
+Framebuffer device used by the LCD.
+
+Use this first:
 
 ```json
 "fb_path": "/dev/fb0"
 ```
 
-or:
+Use this only if the LCD works on `/dev/fb1`:
 
 ```json
 "fb_path": "/dev/fb1"
 ```
 
-### Volumio API URL
+### `width` and `height`
 
-Default local Volumio status endpoint:
+LCD resolution.
 
-```json
-"volumio_url": "http://127.0.0.1:3000/api/v1/getState"
-```
-
-### Album Art
-
-Album art can be enabled or disabled:
+For the 3.5 inch LCDs used here:
 
 ```json
-"show_album_art": true
+"width": 480,
+"height": 320
 ```
 
-or:
+Do not change these unless you are using a different display.
+
+### `clock_type`
+
+Clock format.
+
+Use 12-hour time:
 
 ```json
-"show_album_art": false
+"clock_type": "12h"
 ```
 
-### Screen Brightness
-
-Set the LCD brightness level used by the display program:
+Use 24-hour time:
 
 ```json
-"brightness": 100
+"clock_type": "24h"
 ```
 
-### Clock Mode
+### `return_to_clock_seconds`
 
-Large clock mode is used when nothing is playing.
+How long the display waits before returning to the large clock screen when playback is idle or stopped.
+
+Example:
 
 ```json
-"large_clock_when_idle": true
+"return_to_clock_seconds": 5.0
 ```
 
-or:
+Higher values wait longer.
+
+## Visual Settings
+
+These control clock animation and album art background behaviour.
 
 ```json
-"large_clock_when_idle": false
+"visual": {
+  "colon_alpha_fade_enabled": true,
+  "colon_alpha_fade_hz": 0.5,
+  "colon_alpha_min": 32,
+  "colon_alpha_max": 255,
+  "album_background_enabled": true,
+  "album_background_zoom_percent": 220,
+  "album_background_brightness_percent": 42,
+  "album_background_diagonal_fade_when_title_scrolls": true,
+  "album_background_diagonal_fade_start": 96,
+  "album_background_diagonal_fade_end": 128
+}
 ```
 
-### Restart After Changes
+### `colon_alpha_fade_enabled`
 
-After editing the file:
+Enables the soft fade effect on the clock colon.
 
-```bash
-sudo systemctl restart volumio-fbd
+```json
+"colon_alpha_fade_enabled": true
+```
+
+Turn it off:
+
+```json
+"colon_alpha_fade_enabled": false
+```
+
+### `colon_alpha_fade_hz`
+
+Speed of the colon fade.
+
+```json
+"colon_alpha_fade_hz": 0.5
+```
+
+Lower is slower.  
+Higher is faster.
+
+### `colon_alpha_min` and `colon_alpha_max`
+
+Controls how dim and bright the fading colon gets.
+
+```json
+"colon_alpha_min": 32,
+"colon_alpha_max": 255
+```
+
+`0` is invisible.  
+`255` is fully visible.
+
+### `album_background_enabled`
+
+Uses album art as the screen background while music is playing.
+
+```json
+"album_background_enabled": true
+```
+
+Turn it off for a plain background:
+
+```json
+"album_background_enabled": false
+```
+
+### `album_background_zoom_percent`
+
+Controls how much the background album art is enlarged.
+
+```json
+"album_background_zoom_percent": 220
+```
+
+Higher values zoom in more.
+
+### `album_background_brightness_percent`
+
+Controls how bright the album art background appears.
+
+```json
+"album_background_brightness_percent": 42
+```
+
+Lower is darker.  
+Higher is brighter.
+
+### `album_background_diagonal_fade_when_title_scrolls`
+
+Adds a diagonal fade when long track titles scroll.
+
+```json
+"album_background_diagonal_fade_when_title_scrolls": true
+```
+
+This helps keep scrolling text readable.
+
+### `album_background_diagonal_fade_start` and `album_background_diagonal_fade_end`
+
+Controls where the diagonal fade begins and ends.
+
+```json
+"album_background_diagonal_fade_start": 96,
+"album_background_diagonal_fade_end": 128
+```
+
+Most users should leave these unchanged.
+
+## UI Layout Settings
+
+These control spacing, font sizes, album art size, the progress bar, the volume bar, and AirPlay icon sizing.
+
+```json
+"ui": {
+  "padding": 24,
+  "footer_height": 24,
+  "header_height": 32,
+  "progress_bar_height": 7,
+  "volume_bar_width": 20,
+  "volume_bar_height": 228,
+  "volume_bar_right_margin": 32,
+  "volume_overlay_seconds": 2,
+  "album_art_size": 150,
+  "generic_album_art_size": 136,
+  "title_font_size": 26,
+  "artist_font_size": 18,
+  "album_font_size": 15,
+  "source_font_size": 14,
+  "footer_font_size": 11,
+  "small_clock_font_size": 16,
+  "idle_clock_font_size": 132,
+  "idle_date_font_size": 20,
+  "idle_ip_font_size": 16,
+  "airplay_icon_width": 132,
+  "airplay_icon_height": 78
+}
+```
+
+### `padding`
+
+Outer spacing around the screen content.
+
+```json
+"padding": 24
+```
+
+Lower values give more room.  
+Higher values add more margin.
+
+### `footer_height` and `header_height`
+
+Reserved space for the top and bottom screen areas.
+
+```json
+"footer_height": 24,
+"header_height": 32
+```
+
+### `progress_bar_height`
+
+Height of the playback progress bar.
+
+```json
+"progress_bar_height": 7
+```
+
+### `volume_bar_width`, `volume_bar_height`, and `volume_bar_right_margin`
+
+Controls the vertical volume bar.
+
+```json
+"volume_bar_width": 20,
+"volume_bar_height": 228,
+"volume_bar_right_margin": 32
+```
+
+### `volume_overlay_seconds`
+
+How long the volume overlay stays visible after volume changes.
+
+```json
+"volume_overlay_seconds": 2
+```
+
+### `album_art_size`
+
+Size of normal album art.
+
+```json
+"album_art_size": 150
+```
+
+### `generic_album_art_size`
+
+Size of the fallback album icon when no album image is available.
+
+```json
+"generic_album_art_size": 136
+```
+
+### Font sizes
+
+These control text size for each display area.
+
+```json
+"title_font_size": 26,
+"artist_font_size": 18,
+"album_font_size": 15,
+"source_font_size": 14,
+"footer_font_size": 11,
+"small_clock_font_size": 16,
+"idle_clock_font_size": 132,
+"idle_date_font_size": 20,
+"idle_ip_font_size": 16
+```
+
+Most useful values to adjust:
+
+```json
+"title_font_size": 26
+```
+
+```json
+"idle_clock_font_size": 132
+```
+
+Lower the number if text is too large.  
+Raise it if text is too small.
+
+### `airplay_icon_width` and `airplay_icon_height`
+
+Controls the AirPlay icon size.
+
+```json
+"airplay_icon_width": 132,
+"airplay_icon_height": 78
+```
+
+## Color Settings
+
+Colors use standard hex color values.
+
+```json
+"colors": {
+  "background": "#000000",
+  "text_main": "#FFFFFF",
+  "text_dim": "#AAAAAA",
+  "text_muted": "#777777",
+  "panel": "#050505",
+  "panel_line": "#242424",
+  "progress_bg": "#202020",
+  "progress_fg": "#00FF00",
+  "volume_bar": "#FFFFFF",
+  "album_placeholder": "#181818"
+}
+```
+
+### `background`
+
+Main screen background.
+
+```json
+"background": "#000000"
+```
+
+### `text_main`
+
+Primary text color.
+
+```json
+"text_main": "#FFFFFF"
+```
+
+### `text_dim`
+
+Secondary text color.
+
+```json
+"text_dim": "#AAAAAA"
+```
+
+### `text_muted`
+
+Muted text color for less important details.
+
+```json
+"text_muted": "#777777"
+```
+
+### `panel`
+
+Panel background color.
+
+```json
+"panel": "#050505"
+```
+
+### `panel_line`
+
+Panel border or divider line color.
+
+```json
+"panel_line": "#242424"
+```
+
+### `progress_bg`
+
+Playback progress bar background.
+
+```json
+"progress_bg": "#202020"
+```
+
+### `progress_fg`
+
+Playback progress bar fill color.
+
+```json
+"progress_fg": "#00FF00"
+```
+
+### `volume_bar`
+
+Volume bar color.
+
+```json
+"volume_bar": "#FFFFFF"
+```
+
+### `album_placeholder`
+
+Fallback album art background color.
+
+```json
+"album_placeholder": "#181818"
+```
+
+## Full Default Config
+
+```json
+{
+  "display": {
+    "fb_path": "/dev/fb0",
+    "width": 480,
+    "height": 320,
+    "clock_type": "12h",
+    "return_to_clock_seconds": 5.0
+  },
+  "visual": {
+    "colon_alpha_fade_enabled": true,
+    "colon_alpha_fade_hz": 0.5,
+    "colon_alpha_min": 32,
+    "colon_alpha_max": 255,
+    "album_background_enabled": true,
+    "album_background_zoom_percent": 220,
+    "album_background_brightness_percent": 42,
+    "album_background_diagonal_fade_when_title_scrolls": true,
+    "album_background_diagonal_fade_start": 96,
+    "album_background_diagonal_fade_end": 128
+  },
+  "ui": {
+    "padding": 24,
+    "footer_height": 24,
+    "header_height": 32,
+    "progress_bar_height": 7,
+    "volume_bar_width": 20,
+    "volume_bar_height": 228,
+    "volume_bar_right_margin": 32,
+    "volume_overlay_seconds": 2,
+    "album_art_size": 150,
+    "generic_album_art_size": 136,
+    "title_font_size": 26,
+    "artist_font_size": 18,
+    "album_font_size": 15,
+    "source_font_size": 14,
+    "footer_font_size": 11,
+    "small_clock_font_size": 16,
+    "idle_clock_font_size": 132,
+    "idle_date_font_size": 20,
+    "idle_ip_font_size": 16,
+    "airplay_icon_width": 132,
+    "airplay_icon_height": 78
+  },
+  "colors": {
+    "background": "#000000",
+    "text_main": "#FFFFFF",
+    "text_dim": "#AAAAAA",
+    "text_muted": "#777777",
+    "panel": "#050505",
+    "panel_line": "#242424",
+    "progress_bg": "#202020",
+    "progress_fg": "#00FF00",
+    "volume_bar": "#FFFFFF",
+    "album_placeholder": "#181818"
+  }
+}
 ```
