@@ -321,7 +321,7 @@ The enclosure was designed around the actual hardware stack:
 - InnoMaker HiFi DAC Pro
 - SunFounder MHS35IPS 3.5 inch IPS LCD
 
-## Framebuffer Display Setup
+## Current LCD Setup: SunFounder MHS35IPS
 
 For a fresh Volumio install, do not run the full `LCD-show` installer.
 
@@ -345,10 +345,10 @@ Back up the Volumio user boot config:
 sudo cp /boot/userconfig.txt /boot/userconfig.txt.bak.$(date +%F-%H%M) 2>/dev/null || true
 ```
 
-Remove any previous iCube LCD block:
+Remove any previous MHS35IPS framebuffer block:
 
 ```bash
-sudo sed -i '/# iCube MHS35IPS framebuffer start/,/# iCube MHS35IPS framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
+sudo sed -i '/# MHS35IPS framebuffer start/,/# MHS35IPS framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
 ```
 
 Append the minimal framebuffer configuration:
@@ -356,7 +356,7 @@ Append the minimal framebuffer configuration:
 ```bash
 sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF'
 
-# iCube MHS35IPS framebuffer start
+# MHS35IPS framebuffer start
 hdmi_force_hotplug=1
 dtparam=spi=on
 dtoverlay=mhs35ips:rotate=90
@@ -367,7 +367,7 @@ hdmi_drive=2
 disable_overscan=1
 framebuffer_width=480
 framebuffer_height=320
-# iCube MHS35IPS framebuffer end
+# MHS35IPS framebuffer end
 EOF
 ```
 
@@ -398,6 +398,138 @@ dtoverlay=mhs35ips:rotate=270
 ```
 
 Then reboot.
+
+## Legacy LCD Setup: Older Waveshare 3.5 inch RPi LCD
+
+Use this section only if the build is using the older Waveshare 3.5 inch GPIO LCD instead of the SunFounder MHS35IPS display.
+
+Only one LCD boot block should be active at a time. Remove the SunFounder block before enabling the Waveshare block.
+
+This project does not need the Waveshare desktop, touch, X11, browser, `fbcp`, or auto-login setup. The display program writes directly to the framebuffer.
+
+### Waveshare 3.5 inch RPi LCD (A)
+
+Download only the Waveshare A overlay:
+
+```bash
+sudo mkdir -p /boot/overlays
+
+cd /tmp
+rm -rf Waveshare35a.zip waveshare35a.dtbo
+wget -O Waveshare35a.zip https://files.waveshare.com/wiki/common/Waveshare35a.zip
+unzip -o Waveshare35a.zip
+
+sudo cp waveshare35a.dtbo /boot/overlays/
+```
+
+Back up the Volumio user boot config:
+
+```bash
+sudo cp /boot/userconfig.txt /boot/userconfig.txt.bak.$(date +%F-%H%M) 2>/dev/null || true
+```
+
+Remove any existing display blocks from this guide:
+
+```bash
+sudo sed -i '/# MHS35IPS framebuffer start/,/# MHS35IPS framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
+sudo sed -i '/# Waveshare 3.5 LCD framebuffer start/,/# Waveshare 3.5 LCD framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
+```
+
+Append the minimal Waveshare framebuffer configuration:
+
+```bash
+sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF'
+
+# Waveshare 3.5 LCD framebuffer start
+hdmi_force_hotplug=1
+dtparam=spi=on
+dtoverlay=waveshare35a
+max_usb_current=1
+hdmi_group=2
+hdmi_mode=87
+hdmi_cvt 480 320 60 6 0 0 0
+hdmi_drive=2
+display_rotate=0
+disable_overscan=1
+framebuffer_width=480
+framebuffer_height=320
+# Waveshare 3.5 LCD framebuffer end
+EOF
+```
+
+Reboot:
+
+```bash
+sudo reboot
+```
+
+After reboot, verify the framebuffer:
+
+```bash
+ls -l /dev/fb*
+fbset -fb /dev/fb0 -i
+cat /sys/class/graphics/fb0/name
+```
+
+Test the display program:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb0
+```
+
+If the Waveshare panel appears as `/dev/fb1`, test this instead:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb1
+```
+
+Then update the systemd service `ExecStart` line to match the working framebuffer.
+
+### Waveshare 3.5 inch RPi LCD (B)
+
+If the older screen is the Waveshare 3.5 inch RPi LCD (B), use the B overlay instead.
+
+Download only the Waveshare B overlay:
+
+```bash
+sudo mkdir -p /boot/overlays
+
+cd /tmp
+rm -rf Waveshare35b-v2.zip waveshare35b-v2.dtbo
+wget -O Waveshare35b-v2.zip https://files.waveshare.com/upload/1/1e/Waveshare35b-v2.zip
+unzip -o Waveshare35b-v2.zip
+
+sudo cp waveshare35b-v2.dtbo /boot/overlays/
+```
+
+Use the same boot block as the Waveshare A setup, but change this line:
+
+```text
+dtoverlay=waveshare35a
+```
+
+To this:
+
+```text
+dtoverlay=waveshare35b-v2
+```
+
+Everything else stays the same.
+
+### Waveshare Cleanup Notes
+
+Do not add these Waveshare desktop instructions for this appliance:
+
+- `startx`
+- `.bash_profile` auto-start
+- `lightdm`
+- `raspberrypi-ui-mods`
+- `chromium-browser`
+- touch calibration
+- `fbcp`
+- `/etc/rc.local` startup hacks
+
+Those are for desktop mirroring and touch use. This build only needs the framebuffer device.
 
 ## Enclosure
 
@@ -469,7 +601,7 @@ Paste:
 
 ```ini
 [Unit]
-Description=iCube Volumio Framebuffer Display
+Description=Volumio framebuffer display
 After=network-online.target volumio.service
 Wants=network-online.target
 
