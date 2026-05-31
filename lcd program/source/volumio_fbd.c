@@ -648,19 +648,64 @@ static void json_get_string(json_object *root, const char *key, char *dst, size_
     safe_copy(dst, dst_sz, empty_value(s) ? "" : s);
 }
 
+static double normalize_seek_seconds(double raw, double duration, const char *service, const char *track_type) {
+    double seek = 0.0;
+
+    if (raw <= 0.0) return 0.0;
+
+    bool service_webradio = service && strcmp(service, "webradio") == 0;
+    bool known_ms_source =
+        (service && strcmp(service, "spop") == 0) ||
+        (service && strcmp(service, "mpd") == 0) ||
+        (track_type && strcmp(track_type, "spotify") == 0);
+
+    if (service_webradio) {
+        seek = raw;
+    } else if (known_ms_source) {
+        seek = raw / 1000.0;
+    } else if (duration > 0.0) {
+        double as_seconds = raw;
+        double as_milliseconds = raw / 1000.0;
+
+        bool seconds_valid = as_seconds <= duration;
+        bool milliseconds_valid = as_milliseconds <= duration;
+
+        if (seconds_valid && !milliseconds_valid) {
+            seek = as_seconds;
+        } else if (!seconds_valid && milliseconds_valid) {
+            seek = as_milliseconds;
+        } else if (seconds_valid && milliseconds_valid) {
+            seek = as_seconds;
+        } else {
+            seek = duration;
+        }
+    } else {
+        seek = raw;
+    }
+
+    if (seek < 0.0) seek = 0.0;
+    if (duration > 0.0 && seek > duration) seek = duration;
+
+    return seek;
+}
+
 static bool fetch_volumio(PlayerState *s) {
     if (!s) return false;
+
     size_t len = 0;
     uint8_t *body = http_get(VOLUMIO_STATE_URL, &len);
     if (!body) return false;
+
     json_object *root = json_tokener_parse((const char *)body);
     free(body);
     if (!root) return false;
 
     PlayerState n = *s;
+
     char raw_status[32];
     json_get_string(root, "status", raw_status, sizeof(raw_status));
     normalize_state(n.state, sizeof(n.state), raw_status);
+
     json_get_string(root, "service", n.service, sizeof(n.service));
     json_get_string(root, "trackType", n.track_type, sizeof(n.track_type));
     json_get_string(root, "title", n.title, sizeof(n.title));
@@ -672,16 +717,31 @@ static bool fetch_volumio(PlayerState *s) {
     resolve_albumart(n.art_url, sizeof(n.art_url), n.albumart);
 
     json_object *v = NULL;
+
     n.volume = -1;
-    if (json_object_object_get_ex(root, "volume", &v) && v && json_object_get_type(v) != json_type_null) n.volume = json_object_get_int(v);
-    n.seek = 0.0;
-    if (json_object_object_get_ex(root, "seek", &v) && v && json_object_get_type(v) != json_type_null) {
-        double raw = json_object_get_double(v);
-        n.seek = raw > 10000.0 ? raw / 1000.0 : raw;
+    if (json_object_object_get_ex(root, "volume", &v) &&
+        v &&
+        json_object_get_type(v) != json_type_null) {
+        n.volume = json_object_get_int(v);
     }
+
     n.duration = 0.0;
-    if (json_object_object_get_ex(root, "duration", &v) && v && json_object_get_type(v) != json_type_null) n.duration = json_object_get_double(v);
+    if (json_object_object_get_ex(root, "duration", &v) &&
+        v &&
+        json_object_get_type(v) != json_type_null) {
+        n.duration = json_object_get_double(v);
+    }
+
+    n.seek = 0.0;
+    if (json_object_object_get_ex(root, "seek", &v) &&
+        v &&
+        json_object_get_type(v) != json_type_null) {
+        double raw_seek = json_object_get_double(v);
+        n.seek = normalize_seek_seconds(raw_seek, n.duration, n.service, n.track_type);
+    }
+
     json_object_put(root);
+
     *s = n;
     return true;
 }
