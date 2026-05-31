@@ -20,7 +20,7 @@ This is not a touchscreen kiosk.
 
 It is a small audio appliance display.
 
-The screen should show what matters, stay readable on a cheap LCD, and avoid pretending unreliable metadata is reliable.
+The screen should show what matters, stay readable on a small LCD, and avoid pretending unreliable metadata is reliable.
 
 The project uses this truth model:
 
@@ -31,7 +31,7 @@ ALSA hw_params = actual DAC/output format
 JSON config = user-tunable display behavior
 ```
 
-MPD is not used in the production display path. Testing showed MPD did not reliably expose Spotify or AirPlay playback on this setup, while Volumio did.
+MPD is not used in the production display path. Testing showed that MPD did not reliably expose Spotify or AirPlay playback on this setup, while Volumio did.
 
 ## Display Features
 
@@ -286,7 +286,7 @@ Example config:
 
 ## Performance Design
 
-The display program is designed to avoid unnecessary work.
+The display program avoids unnecessary work.
 
 Current performance principles:
 
@@ -311,7 +311,7 @@ The enclosure was designed around the actual hardware stack:
 - Waveshare PCIe to M.2 Adapter with PoE Function and active cooling
 - NVMe storage
 - InnoMaker HiFi DAC Pro
-- Waveshare 3.5 inch RPi LCD
+- SunFounder MHS35IPS 3.5 inch IPS LCD
 
 ## As Built
 
@@ -319,7 +319,85 @@ The enclosure was designed around the actual hardware stack:
 - Waveshare PCIe to M.2 Adapter with PoE Function and active cooling
 - 128GB NVMe M.2 storage
 - InnoMaker HiFi DAC Pro
-- Waveshare 3.5 inch RPi LCD
+- SunFounder MHS35IPS 3.5 inch IPS LCD
+
+## Framebuffer Display Setup
+
+For a fresh Volumio install, do not run the full `LCD-show` installer.
+
+The full installer adds extra packages and files that are not needed for this project. This build only needs the framebuffer display overlay and the correct boot configuration.
+
+Download only the overlay:
+
+```bash
+sudo mkdir -p /boot/overlays
+
+cd /tmp
+wget -O mhs35ips-overlay.dtb \
+https://raw.githubusercontent.com/sunfounder/LCD-show/master/usr/mhs35ips-overlay.dtb
+
+sudo cp mhs35ips-overlay.dtb /boot/overlays/mhs35ips.dtbo
+```
+
+Back up the Volumio user boot config:
+
+```bash
+sudo cp /boot/userconfig.txt /boot/userconfig.txt.bak.$(date +%F-%H%M) 2>/dev/null || true
+```
+
+Remove any previous iCube LCD block:
+
+```bash
+sudo sed -i '/# iCube MHS35IPS framebuffer start/,/# iCube MHS35IPS framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
+```
+
+Append the minimal framebuffer configuration:
+
+```bash
+sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF'
+
+# iCube MHS35IPS framebuffer start
+hdmi_force_hotplug=1
+dtparam=spi=on
+dtoverlay=mhs35ips:rotate=90
+hdmi_group=2
+hdmi_mode=87
+hdmi_cvt 480 320 60 6 0 0 0
+hdmi_drive=2
+disable_overscan=1
+framebuffer_width=480
+framebuffer_height=320
+# iCube MHS35IPS framebuffer end
+EOF
+```
+
+Reboot:
+
+```bash
+sudo reboot
+```
+
+After reboot, verify the framebuffer:
+
+```bash
+ls -l /dev/fb*
+fbset -fb /dev/fb0 -i
+cat /sys/class/graphics/fb0/name
+```
+
+If the display is rotated wrong, edit this line in `/boot/userconfig.txt`:
+
+```text
+dtoverlay=mhs35ips:rotate=90
+```
+
+Try:
+
+```text
+dtoverlay=mhs35ips:rotate=270
+```
+
+Then reboot.
 
 ## Enclosure
 
@@ -338,7 +416,7 @@ The OpenSCAD case includes:
 - DAC jack labels
 - Solid sticky-foot pads for side orientation
 
-A lot of Raspberry Pi Volumio builds are either bare boards, generic cases, or full touchscreen setups running more software than needed.
+A lot of Raspberry Pi Volumio builds are bare boards, generic cases, or full touchscreen setups running more software than needed.
 
 This one is built more like a simple audio appliance.
 
@@ -366,37 +444,32 @@ gcc -Os -pipe -Wall -Wextra -pthread \
 Install:
 
 ```bash
-sudo systemctl stop volumio_fbd.service
+sudo systemctl stop volumio-fbd.service 2>/dev/null || true
 sudo cp -f volumio_fbd /usr/local/bin/volumio_fbd
 sudo chmod 755 /usr/local/bin/volumio_fbd
-sudo systemctl restart volumio_fbd.service
 ```
 
-## Systemd Service Notes
+Test manually:
 
-The Linux framebuffer console can draw over the LCD if it remains attached.
-
-The blinking console cursor is not a C code issue. It is a kernel framebuffer console setting.
-
-Recommended service fix:
-
-```ini
-ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true'
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb0
 ```
 
-If the Volumio console banner appears on the LCD, unbind fbcon before starting the display:
+Stop the manual test with `Ctrl+C`.
 
-```ini
-ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
-```
+## Systemd Service
 
-Example service:
+Create the service:
 
+```bash
 sudo nano /etc/systemd/system/volumio-fbd.service
+```
+
+Paste:
 
 ```ini
 [Unit]
-Description=Volumio framebuffer display
+Description=iCube Volumio Framebuffer Display
 After=network-online.target volumio.service
 Wants=network-online.target
 
@@ -404,10 +477,11 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true'
 ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
-ExecStart=/usr/local/bin/volumio_fbd
+ExecStart=/usr/local/bin/volumio_fbd /dev/fb0
 Restart=always
-RestartSec=2
+RestartSec=3
 User=root
+WorkingDirectory=/usr/local/bin
 TimeoutStopSec=3
 KillMode=control-group
 
@@ -415,13 +489,44 @@ KillMode=control-group
 WantedBy=multi-user.target
 ```
 
-Reload after editing:
+Reload and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable volumio-fbd
-sudo systemctl start volumio-fbd
-sudo systemctl status volumio-fbd
+sudo systemctl enable volumio-fbd.service
+sudo systemctl start volumio-fbd.service
+sudo systemctl status volumio-fbd.service
+```
+
+If the LCD appears as `/dev/fb1`, change only this line:
+
+```ini
+ExecStart=/usr/local/bin/volumio_fbd /dev/fb1
+```
+
+Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart volumio-fbd.service
+```
+
+## Console Notes
+
+The Linux framebuffer console can draw over the LCD if it remains attached.
+
+The blinking console cursor is not a C code issue. It is a kernel framebuffer console setting.
+
+The service disables the cursor blink before starting the display:
+
+```ini
+ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true'
+```
+
+If the Volumio console banner appears on the LCD, the service also attempts to unbind fbcon:
+
+```ini
+ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
 ```
 
 ## What This Is
