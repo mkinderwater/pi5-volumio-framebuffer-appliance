@@ -104,6 +104,8 @@ No background image.
 
 Pick one LCD section only.
 
+This guide assumes a fresh bare-metal Volumio install.
+
 Use SunFounder for the current LCD.  
 Use TFT35A for the older Waveshare-compatible LCD.
 
@@ -117,7 +119,6 @@ Download only the overlay:
 sudo mkdir -p /boot/overlays
 
 cd /tmp
-rm -f mhs35ips-overlay.dtb
 wget -O mhs35ips-overlay.dtb \
 https://raw.githubusercontent.com/sunfounder/LCD-show/master/usr/mhs35ips-overlay.dtb
 
@@ -177,7 +178,6 @@ sudo apt install -y git
 sudo mkdir -p /boot/overlays
 
 cd /tmp
-rm -rf LCD-show
 git clone --depth 1 https://github.com/goodtft/LCD-show.git
 
 sudo cp /tmp/LCD-show/usr/tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
@@ -268,11 +268,10 @@ This is the fastest path.
 sudo apt update
 sudo apt install -y git
 
-sudo rm -rf /opt/pi5-volumio-framebuffer-appliance
 sudo git clone --depth 1 https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance.git /opt/pi5-volumio-framebuffer-appliance
 
 sudo install -m 755 "/opt/pi5-volumio-framebuffer-appliance/lcd program/compiled/volumio_fbd" /usr/local/bin/volumio_fbd
-sudo cp -f "/opt/pi5-volumio-framebuffer-appliance/volumio_fbd_config.json" /etc/volumio_fbd_config.json
+sudo cp "/opt/pi5-volumio-framebuffer-appliance/volumio_fbd_config.json" /etc/volumio_fbd_config.json
 sudo chmod 644 /etc/volumio_fbd_config.json
 ```
 
@@ -296,7 +295,6 @@ Use this if you want to compile the current source on the Pi.
 sudo apt update
 sudo apt install -y git build-essential pkg-config libcurl4-openssl-dev libjson-c-dev libfreetype6-dev
 
-sudo rm -rf /opt/pi5-volumio-framebuffer-appliance
 sudo git clone --depth 1 https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance.git /opt/pi5-volumio-framebuffer-appliance
 
 cd "/opt/pi5-volumio-framebuffer-appliance/lcd program/source"
@@ -310,7 +308,7 @@ gcc -Os -pipe -Wall -Wextra -pthread \
   -lm -Wl,--gc-sections -s
 
 sudo install -m 755 volumio_fbd /usr/local/bin/volumio_fbd
-sudo cp -f "/opt/pi5-volumio-framebuffer-appliance/volumio_fbd_config.json" /etc/volumio_fbd_config.json
+sudo cp "/opt/pi5-volumio-framebuffer-appliance/volumio_fbd_config.json" /etc/volumio_fbd_config.json
 sudo chmod 644 /etc/volumio_fbd_config.json
 ```
 
@@ -354,7 +352,7 @@ gcc -Os -pipe -Wall -Wextra -pthread \
 Install:
 
 ```bash
-sudo cp -f volumio_fbd /usr/local/bin/volumio_fbd
+sudo cp volumio_fbd /usr/local/bin/volumio_fbd
 sudo chmod 755 /usr/local/bin/volumio_fbd
 ```
 
