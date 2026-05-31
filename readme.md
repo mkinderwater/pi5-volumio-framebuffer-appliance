@@ -159,45 +159,6 @@ https://raw.githubusercontent.com/mkinderwater/pi5-volumio-framebuffer-appliance
 sudo chmod 755 /usr/local/bin/volumio_fbd
 ```
 
-Run it once:
-
-```bash
-sudo /usr/local/bin/volumio_fbd /dev/fb0
-```
-
-The first run creates the config file:
-
-```text
-/etc/volumio_fbd_config.json
-```
-
-Edit it after first run:
-
-```bash
-sudo nano /etc/volumio_fbd_config.json
-```
-
-If the LCD uses `/dev/fb1`, change the config value from:
-
-```json
-"fb_path": "/dev/fb0"
-```
-
-to:
-
-```json
-"fb_path": "/dev/fb1"
-```
-
-## 3. Verify Framebuffer
-
-After reboot and binary install:
-
-```bash
-ls -l /dev/fb*
-cat /sys/class/graphics/fb0/name
-```
-
 Test `/dev/fb0` first:
 
 ```bash
@@ -211,6 +172,21 @@ sudo /usr/local/bin/volumio_fbd /dev/fb1
 ```
 
 Use whichever framebuffer works in the service.
+
+## 3. Verify Framebuffer
+
+After reboot and binary install:
+
+```bash
+ls -l /dev/fb*
+cat /sys/class/graphics/fb0/name
+```
+
+If `/dev/fb1` exists, check it too:
+
+```bash
+cat /sys/class/graphics/fb1/name
+```
 
 ## 4. Optional: Build From Source
 
@@ -238,7 +214,7 @@ sudo cp volumio_fbd /usr/local/bin/volumio_fbd
 sudo chmod 755 /usr/local/bin/volumio_fbd
 ```
 
-Run once to create the config:
+Test it:
 
 ```bash
 sudo /usr/local/bin/volumio_fbd /dev/fb0
@@ -262,8 +238,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+
+# Disable the Linux console cursor blink.
+# Without this, a blinking cursor may appear over the framebuffer display.
 ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true'
+
+# Detach the Linux virtual console from the LCD framebuffer when available.
+# This helps prevent console text or cursor artifacts from showing on the screen.
 ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
+
 ExecStart=/usr/local/bin/volumio_fbd /dev/fb0
 Restart=always
 RestartSec=2
@@ -302,7 +285,9 @@ Restart after replacing the binary:
 sudo systemctl restart volumio-fbd
 ```
 
-## 6. Update Later
+## 6. Upgrade to the Latest Release
+
+Use this if you want to upgrade to the latest release.
 
 ```bash
 sudo systemctl stop volumio-fbd 2>/dev/null || true
@@ -314,4 +299,86 @@ sudo chmod 755 /usr/local/bin/volumio_fbd
 sudo systemctl restart volumio-fbd
 ```
 
-This does not overwrite your JSON config.
+This does not overwrite your local settings.
+
+## 7. JSON Settings
+
+The first run creates:
+
+```text
+/etc/volumio_fbd_config.json
+```
+
+Edit it here:
+
+```bash
+sudo nano /etc/volumio_fbd_config.json
+```
+
+Common changes:
+
+### Framebuffer
+
+Use `/dev/fb0` unless your LCD works on `/dev/fb1`.
+
+```json
+"fb_path": "/dev/fb0"
+```
+
+or:
+
+```json
+"fb_path": "/dev/fb1"
+```
+
+### Volumio API URL
+
+Default local Volumio status endpoint:
+
+```json
+"volumio_url": "http://127.0.0.1:3000/api/v1/getState"
+```
+
+### Album Art
+
+Album art can be enabled or disabled:
+
+```json
+"show_album_art": true
+```
+
+or:
+
+```json
+"show_album_art": false
+```
+
+### Screen Brightness
+
+Set the LCD brightness level used by the display program:
+
+```json
+"brightness": 100
+```
+
+### Clock Mode
+
+Large clock mode is used when nothing is playing.
+
+```json
+"large_clock_when_idle": true
+```
+
+or:
+
+```json
+"large_clock_when_idle": false
+```
+
+### Restart After Changes
+
+After editing the file:
+
+```bash
+sudo systemctl restart volumio-fbd
+```
