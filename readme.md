@@ -1,50 +1,79 @@
 # Raspberry Pi 5 Volumio Framebuffer Appliance
 
-This is a small, purpose-built Raspberry Pi 5 Volumio appliance with M.2 storage, DAC output, PoE, and a minimal LCD status screen.
+A small Raspberry Pi 5 Volumio player with M.2 storage, DAC output, PoE, and a minimal 3.5 inch LCD status screen.
 
-The hardware is only half the project. The other half is the display program, written in C.
+The display program is written in C and writes directly to the Linux framebuffer.
 
-Instead of running a desktop, browser, kiosk mode, or heavy plugin just to show basic music info, this build writes directly to the Linux framebuffer. No X11, Wayland, Chromium, or Chromium-based UI stack runs in the background.
+No desktop.  
+No browser.  
+No X11.  
+No Wayland.  
+No touch kiosk.  
+No full LCD vendor installer.
 
-On my Raspberry Pi 5, the display program is designed to stay extremely light, usually sitting under 1% CPU during normal use.
-
-The goal is simple:
+The goal:
 
 ```text
 Show useful Volumio information without wasting the Pi.
 ```
 
-## Design Philosophy
+## Fresh Install Assumption
 
-This is not a touchscreen kiosk.
+This guide assumes a fresh bare-metal Volumio install on a Raspberry Pi 5.
 
-It is a small audio appliance display.
+Custom boot settings go here:
 
-The screen should show what matters, stay readable on a small LCD, and avoid pretending unreliable metadata is reliable.
+```text
+/boot/userconfig.txt
+```
 
-The project uses this truth model:
+Do not run these unless you want extra desktop/touch/browser setup:
+
+```bash
+sudo ./MHS35IPS-show
+sudo ./LCD35-show
+sudo ./LCD35B-show
+sudo ./LCD35B-show V2
+```
+
+This appliance only needs:
+
+- LCD overlay
+- SPI enabled
+- 480x320 framebuffer timing
+- `/dev/fb0` or `/dev/fb1`
+- `volumio_fbd` systemd service
+
+## Hardware Stack
+
+- Raspberry Pi 5
+- Waveshare PCIe to M.2 Adapter with PoE Function and active cooling
+- 128GB NVMe M.2 storage
+- InnoMaker HiFi DAC Pro
+- 3.5 inch GPIO LCD
+
+## Display Truth Model
 
 ```text
 Volumio = source, metadata, artwork, volume
 ALSA status = whether audio is actually playing
 ALSA hw_params = actual DAC/output format
-JSON config = user-tunable display behavior
+JSON config = display tuning
 ```
 
-MPD is not used in the production display path. Testing showed that MPD did not reliably expose Spotify or AirPlay playback on this setup, while Volumio did.
+MPD is not used in the production display path.
+
+Volumio gives the source and metadata.  
+ALSA tells whether audio is actually moving.  
+ALSA also tells the real output format reaching the DAC.
 
 ## Display Features
-
-The LCD displays:
 
 - Large idle clock
 - Date
 - Device IP address
 - Spotify playback screen
-- Spotify song title
-- Spotify artist
-- Spotify album
-- Spotify album artwork
+- Spotify title, artist, album, and artwork
 - Spotify progress bar
 - Scrolling song title when needed
 - Dimmed Spotify album-art background
@@ -53,11 +82,11 @@ The LCD displays:
 - Actual ALSA output format
 - Right-side vertical volume bar
 - Blinking colon heartbeat effect
-- Return-to-clock behavior based on actual ALSA audio activity
+- Return-to-clock based on actual ALSA audio activity
 
 ## Idle Screen
 
-When nothing is playing, the big clock screen shows only:
+When nothing is playing, the screen shows only:
 
 ```text
 Clock
@@ -65,174 +94,214 @@ Date
 Device IP address
 ```
 
-No extra footer.  
-No ALSA status text.  
-No source labels.  
+No footer.  
+No source label.  
+No ALSA text.  
 No stale album art.  
 No background image.
 
-The idle screen is intentionally clean.
+## LCD Setup
 
-## Spotify Screen
+Pick one LCD section only.
 
-Spotify is treated as the reliable rich-media source.
+Use SunFounder for the current LCD.  
+Use Waveshare for the older Waveshare LCD.
 
-Spotify displays:
+After changing LCD boot settings, reboot before testing the framebuffer app.
 
-- Album art
-- Song title
-- Artist
-- Album
-- Progress bar
-- Scrolling title if needed
-- Actual output format
-- Volume overlay when volume changes
+## Current LCD: SunFounder MHS35IPS
 
-Spotify album art is trusted directly from Volumio because Spotify provides stable artwork URLs.
+Download only the overlay:
 
-Typical Spotify artwork:
+```bash
+sudo mkdir -p /boot/overlays
 
-```text
-https://i.scdn.co/image/...
+cd /tmp
+rm -f mhs35ips-overlay.dtb
+wget -O mhs35ips-overlay.dtb \
+https://raw.githubusercontent.com/sunfounder/LCD-show/master/usr/mhs35ips-overlay.dtb
+
+sudo cp mhs35ips-overlay.dtb /boot/overlays/mhs35ips.dtbo
 ```
 
-No fallback artwork is used for Spotify.
+Append the Volumio boot block:
 
-## AirPlay Screen
+```bash
+sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF_BOOT'
 
-AirPlay metadata and artwork are inconsistent through Volumio, so AirPlay gets a clean source screen instead of a fake media screen.
-
-AirPlay displays:
-
-- Centered AirPlay-style icon
-- Actual ALSA output format if available
-- Right-side volume bar when volume changes
-
-AirPlay does not display:
-
-- Title
-- Artist
-- Album
-- Album art
-- Progress bar
-- Pause state
-
-This is intentional. It keeps the UI accurate instead of showing stale or guessed information.
-
-## Audio Truth
-
-The program does not rely on Volumio alone to decide whether audio is actually playing.
-
-Playback activity comes from ALSA:
-
-```text
-/proc/asound/card*/pcm*/sub*/status
+# MHS35IPS framebuffer
+hdmi_force_hotplug=1
+dtparam=spi=on
+dtoverlay=mhs35ips:rotate=270
+hdmi_group=2
+hdmi_mode=87
+hdmi_cvt 480 320 60 6 0 0 0
+hdmi_drive=2
+disable_overscan=1
+framebuffer_width=480
+framebuffer_height=320
+EOF_BOOT
 ```
 
-If any active playback status contains:
+Default rotation:
 
 ```text
-state: RUNNING
+dtoverlay=mhs35ips:rotate=270
 ```
 
-the display treats audio as active.
-
-When ALSA is no longer running, the return-to-clock timer starts.
-
-## Output Format Truth
-
-The program reads ALSA hardware output format from:
+Alternate rotation if the screen is wrong:
 
 ```text
-/proc/asound/card*/pcm*/sub*/hw_params
+dtoverlay=mhs35ips:rotate=90
 ```
 
-This allows the LCD to show the actual output format reaching the DAC.
+Reboot:
 
-Example ALSA output:
+```bash
+sudo reboot
+```
+
+## Older LCD: Waveshare 3.5 inch GPIO LCD
+
+Use the Waveshare git repo only to get the overlay files.
+
+Do not run the Waveshare installer scripts.
+
+Download the overlay files:
+
+```bash
+sudo apt update
+sudo apt install -y git
+sudo mkdir -p /boot/overlays
+
+cd /tmp
+rm -rf LCD-show
+git clone --depth 1 https://github.com/waveshare/LCD-show.git
+```
+
+For Waveshare 3.5 inch LCD A:
+
+```bash
+sudo cp /tmp/LCD-show/waveshare35a-overlay.dtb /boot/overlays/waveshare35a.dtbo
+```
+
+For Waveshare 3.5 inch LCD B v2:
+
+```bash
+sudo cp /tmp/LCD-show/waveshare35b-v2-overlay.dtb /boot/overlays/waveshare35b-v2.dtbo
+```
+
+Append the Volumio boot block for Waveshare A:
+
+```bash
+sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF_BOOT'
+
+# Waveshare 3.5 GPIO LCD framebuffer
+hdmi_force_hotplug=1
+dtparam=spi=on
+dtoverlay=waveshare35a:rotate=270
+max_usb_current=1
+hdmi_group=2
+hdmi_mode=87
+hdmi_cvt 480 320 60 6 0 0 0
+hdmi_drive=2
+disable_overscan=1
+framebuffer_width=480
+framebuffer_height=320
+EOF_BOOT
+```
+
+For Waveshare B v2, use the same block but replace this line:
 
 ```text
-format: S32_LE
-channels: 2
-rate: 44100 (44100/1)
+dtoverlay=waveshare35a:rotate=270
 ```
 
-Displayed as:
+with:
 
 ```text
-44.1/32/St
+dtoverlay=waveshare35b-v2:rotate=270
 ```
 
-This is hardware output truth, not guessed media metadata.
-
-## Album Background Behavior
-
-Spotify can show a zoomed, dimmed album-art background.
-
-The behavior depends on whether the song title scrolls:
+Default rotation:
 
 ```text
-If the title does not scroll:
-  show the full dimmed zoomed album background
-
-If the title scrolls:
-  fade the background to black at the 50% diagonal
+rotate=270
 ```
 
-This keeps long scrolling titles readable.
+Alternate rotation if the screen is wrong:
 
-AirPlay never uses album background.
+```text
+rotate=90
+```
 
-The big clock never uses album background.
+Reboot:
 
-## Volume Display
+```bash
+sudo reboot
+```
 
-Volume feedback is unified across active sources.
+## Verify Framebuffer
 
-When volume changes, the display shows:
+After reboot:
 
-- A right-side vertical bar
-- White fill
-- Current volume value
-- Fade-out after a short delay
+```bash
+ls -l /dev/fb*
+fbset -fb /dev/fb0 -i
+cat /sys/class/graphics/fb0/name
+```
 
-The volume bar is intentionally simple and readable on a low-cost LCD.
+Test the display app:
 
-## JSON Configuration
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb0
+```
 
-The display is configured through:
+If the LCD is on `/dev/fb1`:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb1
+```
+
+Use whichever framebuffer works in the systemd service.
+
+## Build
+
+Install build dependencies:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libcurl4-openssl-dev libjson-c-dev libfreetype6-dev
+```
+
+Build:
+
+```bash
+gcc -Os -pipe -Wall -Wextra -pthread \
+  -ffunction-sections -fdata-sections \
+  $(pkg-config --cflags freetype2) \
+  volumio_fbd.c \
+  -o volumio_fbd \
+  $(pkg-config --libs freetype2 libcurl json-c) \
+  -lm -Wl,--gc-sections -s
+```
+
+Install:
+
+```bash
+sudo cp -f volumio_fbd /usr/local/bin/volumio_fbd
+sudo chmod 755 /usr/local/bin/volumio_fbd
+```
+
+## JSON Config
+
+The display config lives here:
 
 ```text
 /etc/volumio_fbd_config.json
 ```
 
-The JSON file controls display behavior and visual tuning without recompiling.
-
-It can control:
-
-- Framebuffer path
-- Render width
-- Render height
-- Clock format
-- Return-to-clock delay
-- Font sizes
-- Padding
-- Album art size
-- Volume bar size
-- Colors
-- Colon fade speed
-- Album background behavior
-
-It should not control playback truth.
-
-Playback truth remains in code:
-
-```text
-Volumio = metadata/source
-ALSA = audio truth
-```
-
-Example config:
+Example:
 
 ```json
 {
@@ -284,310 +353,17 @@ Example config:
 }
 ```
 
-## Performance Design
+If the LCD uses `/dev/fb1`, change:
 
-The display program avoids unnecessary work.
-
-Current performance principles:
-
-- Use Volumio polling in a background thread
-- Keep network and image decoding off the render loop
-- Cache FreeType glyphs
-- Cache scaled album art
-- Cache scrolling title strips
-- Cache zoomed album background
-- Use dirty framebuffer spans
-- Use accurate frame pacing
-- Cache active ALSA status paths
-- Cache active ALSA hw_params paths
-
-The render loop should draw from prepared state, not wait on network calls or JPEG decoding.
-
-## Hardware Stack
-
-The enclosure was designed around the actual hardware stack:
-
-- Raspberry Pi 5
-- Waveshare PCIe to M.2 Adapter with PoE Function and active cooling
-- NVMe storage
-- InnoMaker HiFi DAC Pro
-- SunFounder MHS35IPS 3.5 inch IPS LCD
-
-## As Built
-
-- Raspberry Pi 5
-- Waveshare PCIe to M.2 Adapter with PoE Function and active cooling
-- 128GB NVMe M.2 storage
-- InnoMaker HiFi DAC Pro
-- SunFounder MHS35IPS 3.5 inch IPS LCD
-
-## Current LCD Setup: SunFounder MHS35IPS
-
-For a fresh Volumio install, do not run the full `LCD-show` installer.
-
-The full installer adds extra packages and files that are not needed for this project. This build only needs the framebuffer display overlay and the correct boot configuration.
-
-Download only the overlay:
-
-```bash
-sudo mkdir -p /boot/overlays
-
-cd /tmp
-wget -O mhs35ips-overlay.dtb \
-https://raw.githubusercontent.com/sunfounder/LCD-show/master/usr/mhs35ips-overlay.dtb
-
-sudo cp mhs35ips-overlay.dtb /boot/overlays/mhs35ips.dtbo
+```json
+"fb_path": "/dev/fb0"
 ```
 
-Back up the Volumio user boot config:
+to:
 
-```bash
-sudo cp /boot/userconfig.txt /boot/userconfig.txt.bak.$(date +%F-%H%M) 2>/dev/null || true
+```json
+"fb_path": "/dev/fb1"
 ```
-
-Remove any previous MHS35IPS framebuffer block:
-
-```bash
-sudo sed -i '/# MHS35IPS framebuffer start/,/# MHS35IPS framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
-```
-
-Append the minimal framebuffer configuration:
-
-```bash
-sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF'
-
-# MHS35IPS framebuffer start
-hdmi_force_hotplug=1
-dtparam=spi=on
-dtoverlay=mhs35ips:rotate=90
-hdmi_group=2
-hdmi_mode=87
-hdmi_cvt 480 320 60 6 0 0 0
-hdmi_drive=2
-disable_overscan=1
-framebuffer_width=480
-framebuffer_height=320
-# MHS35IPS framebuffer end
-EOF
-```
-
-Reboot:
-
-```bash
-sudo reboot
-```
-
-After reboot, verify the framebuffer:
-
-```bash
-ls -l /dev/fb*
-fbset -fb /dev/fb0 -i
-cat /sys/class/graphics/fb0/name
-```
-
-If the display is rotated wrong, edit this line in `/boot/userconfig.txt`:
-
-```text
-dtoverlay=mhs35ips:rotate=90
-```
-
-Try:
-
-```text
-dtoverlay=mhs35ips:rotate=270
-```
-
-Then reboot.
-
-## Legacy LCD Setup: Older Waveshare 3.5 inch RPi LCD
-
-Use this section only if the build is using the older Waveshare 3.5 inch GPIO LCD instead of the SunFounder MHS35IPS display.
-
-Only one LCD boot block should be active at a time. Remove the SunFounder block before enabling the Waveshare block.
-
-This project does not need the Waveshare desktop, touch, X11, browser, `fbcp`, or auto-login setup. The display program writes directly to the framebuffer.
-
-### Waveshare 3.5 inch RPi LCD (A)
-
-Download only the Waveshare A overlay:
-
-```bash
-sudo mkdir -p /boot/overlays
-
-cd /tmp
-rm -rf Waveshare35a.zip waveshare35a.dtbo
-wget -O Waveshare35a.zip https://files.waveshare.com/wiki/common/Waveshare35a.zip
-unzip -o Waveshare35a.zip
-
-sudo cp waveshare35a.dtbo /boot/overlays/
-```
-
-Back up the Volumio user boot config:
-
-```bash
-sudo cp /boot/userconfig.txt /boot/userconfig.txt.bak.$(date +%F-%H%M) 2>/dev/null || true
-```
-
-Remove any existing display blocks from this guide:
-
-```bash
-sudo sed -i '/# MHS35IPS framebuffer start/,/# MHS35IPS framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
-sudo sed -i '/# Waveshare 3.5 LCD framebuffer start/,/# Waveshare 3.5 LCD framebuffer end/d' /boot/userconfig.txt 2>/dev/null || true
-```
-
-Append the minimal Waveshare framebuffer configuration:
-
-```bash
-sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF'
-
-# Waveshare 3.5 LCD framebuffer start
-hdmi_force_hotplug=1
-dtparam=spi=on
-dtoverlay=waveshare35a
-max_usb_current=1
-hdmi_group=2
-hdmi_mode=87
-hdmi_cvt 480 320 60 6 0 0 0
-hdmi_drive=2
-display_rotate=0
-disable_overscan=1
-framebuffer_width=480
-framebuffer_height=320
-# Waveshare 3.5 LCD framebuffer end
-EOF
-```
-
-Reboot:
-
-```bash
-sudo reboot
-```
-
-After reboot, verify the framebuffer:
-
-```bash
-ls -l /dev/fb*
-fbset -fb /dev/fb0 -i
-cat /sys/class/graphics/fb0/name
-```
-
-Test the display program:
-
-```bash
-sudo /usr/local/bin/volumio_fbd /dev/fb0
-```
-
-If the Waveshare panel appears as `/dev/fb1`, test this instead:
-
-```bash
-sudo /usr/local/bin/volumio_fbd /dev/fb1
-```
-
-Then update the systemd service `ExecStart` line to match the working framebuffer.
-
-### Waveshare 3.5 inch RPi LCD (B)
-
-If the older screen is the Waveshare 3.5 inch RPi LCD (B), use the B overlay instead.
-
-Download only the Waveshare B overlay:
-
-```bash
-sudo mkdir -p /boot/overlays
-
-cd /tmp
-rm -rf Waveshare35b-v2.zip waveshare35b-v2.dtbo
-wget -O Waveshare35b-v2.zip https://files.waveshare.com/upload/1/1e/Waveshare35b-v2.zip
-unzip -o Waveshare35b-v2.zip
-
-sudo cp waveshare35b-v2.dtbo /boot/overlays/
-```
-
-Use the same boot block as the Waveshare A setup, but change this line:
-
-```text
-dtoverlay=waveshare35a
-```
-
-To this:
-
-```text
-dtoverlay=waveshare35b-v2
-```
-
-Everything else stays the same.
-
-### Waveshare Cleanup Notes
-
-Do not add these Waveshare desktop instructions for this appliance:
-
-- `startx`
-- `.bash_profile` auto-start
-- `lightdm`
-- `raspberrypi-ui-mods`
-- `chromium-browser`
-- touch calibration
-- `fbcp`
-- `/etc/rc.local` startup hacks
-
-Those are for desktop mirroring and touch use. This build only needs the framebuffer device.
-
-## Enclosure
-
-The OpenSCAD case includes:
-
-- USB-C cutout
-- HDMI cutouts
-- Audio jack cutouts
-- Ethernet cutout
-- USB cutouts
-- MicroSD access
-- Bottom intake vents
-- Side fin vents
-- Stronger M2.5 mounting points
-- Lid screw mounts
-- DAC jack labels
-- Solid sticky-foot pads for side orientation
-
-A lot of Raspberry Pi Volumio builds are bare boards, generic cases, or full touchscreen setups running more software than needed.
-
-This one is built more like a simple audio appliance.
-
-## Build
-
-Install dependencies:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config libcurl4-openssl-dev libjson-c-dev libfreetype6-dev
-```
-
-Build:
-
-```bash
-gcc -Os -pipe -Wall -Wextra -pthread \
-  -ffunction-sections -fdata-sections \
-  $(pkg-config --cflags freetype2) \
-  volumio_fbd.c \
-  -o volumio_fbd \
-  $(pkg-config --libs freetype2 libcurl json-c) \
-  -lm -Wl,--gc-sections -s
-```
-
-Install:
-
-```bash
-sudo systemctl stop volumio-fbd.service 2>/dev/null || true
-sudo cp -f volumio_fbd /usr/local/bin/volumio_fbd
-sudo chmod 755 /usr/local/bin/volumio_fbd
-```
-
-Test manually:
-
-```bash
-sudo /usr/local/bin/volumio_fbd /dev/fb0
-```
-
-Stop the manual test with `Ctrl+C`.
 
 ## Systemd Service
 
@@ -611,9 +387,8 @@ ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/
 ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
 ExecStart=/usr/local/bin/volumio_fbd /dev/fb0
 Restart=always
-RestartSec=3
+RestartSec=2
 User=root
-WorkingDirectory=/usr/local/bin
 TimeoutStopSec=3
 KillMode=control-group
 
@@ -621,103 +396,53 @@ KillMode=control-group
 WantedBy=multi-user.target
 ```
 
-Reload and start:
+If the LCD uses `/dev/fb1`, change:
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable volumio-fbd.service
-sudo systemctl start volumio-fbd.service
-sudo systemctl status volumio-fbd.service
+```ini
+ExecStart=/usr/local/bin/volumio_fbd /dev/fb0
 ```
 
-If the LCD appears as `/dev/fb1`, change only this line:
+to:
 
 ```ini
 ExecStart=/usr/local/bin/volumio_fbd /dev/fb1
 ```
 
-Then reload and restart:
+Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl restart volumio-fbd.service
+sudo systemctl enable volumio-fbd
+sudo systemctl start volumio-fbd
+sudo systemctl status volumio-fbd
 ```
 
-## Console Notes
+Restart after replacing the binary:
 
-The Linux framebuffer console can draw over the LCD if it remains attached.
-
-The blinking console cursor is not a C code issue. It is a kernel framebuffer console setting.
-
-The service disables the cursor blink before starting the display:
-
-```ini
-ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null || true'
+```bash
+sudo systemctl restart volumio-fbd
 ```
 
-If the Volumio console banner appears on the LCD, the service also attempts to unbind fbcon:
+## Do Not Add
 
-```ini
-ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true'
-```
+Do not add these for this appliance:
 
-## What This Is
-
-This is not trying to be a commercial hi-fi unit.
-
-It is a clean Raspberry Pi 5 Volumio player with:
-
-- M.2 NVMe storage
-- DAC output
-- PoE support
-- Minimal LCD display
-- Purpose-built enclosure
-- Low-overhead framebuffer display software
-
-It does one job well.
-
-## What This Is Not
-
-This is not:
-
-- A Chromium kiosk
-- A desktop UI
-- A touchscreen-first interface
-- A Volumio plugin replacement
-- A general-purpose media dashboard
-- A commercial product
-
-It is a simple appliance display for a specific Volumio build.
-
-## Included Files
-
-This repository includes:
-
-- Source files
-- OpenSCAD design files
-- C display program
-- Compiled binary
-- Install notes
-- JSON configuration notes
-- Bill of materials
-
-## Production Notes
-
-The production display binary should stay clean.
-
-Do not re-add:
-
+- `startx`
+- `.bash_profile` auto-start
+- `lightdm`
+- `raspberrypi-ui-mods`
+- `chromium-browser`
+- X11 touch calibration
+- `fbcp`
+- `/etc/rc.local` startup hacks
 - MPD playback logic
-- AirPlay pause guessing
 - Spotify fallback artwork
-- Custom socket HTTP stack
-- Debug logging in production
-- Complex source-specific state machines
+- AirPlay pause guessing
 
 Keep the truth split:
 
 ```text
-Volumio tells us what is playing.
-ALSA tells us whether audio is moving.
-JSON tells us how the display should look.
+Volumio tells what is playing.
+ALSA tells whether audio is moving.
+JSON tells how the display should look.
 ```
