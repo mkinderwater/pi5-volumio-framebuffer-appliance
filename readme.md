@@ -105,7 +105,7 @@ No background image.
 Pick one LCD section only.
 
 Use SunFounder for the current LCD.  
-Use Waveshare for the older Waveshare LCD.
+Use TFT35A for the older Waveshare-compatible LCD.
 
 After changing LCD boot settings, reboot before testing the framebuffer app.
 
@@ -161,13 +161,15 @@ Reboot:
 sudo reboot
 ```
 
-## Older LCD: Waveshare 3.5 inch GPIO LCD
+## Older LCD: TFT35A / Older Waveshare-Compatible 3.5 Inch GPIO LCD
 
-Use the Waveshare git repo only to get the overlay files.
+The older LCD used the `tft35a` overlay.
 
-Do not run the Waveshare installer scripts.
+Use the GoodTFT git repo only to get the overlay file.
 
-Download the overlay files:
+Do not run the installer script.
+
+Download the overlay:
 
 ```bash
 sudo apt update
@@ -176,30 +178,20 @@ sudo mkdir -p /boot/overlays
 
 cd /tmp
 rm -rf LCD-show
-git clone --depth 1 https://github.com/waveshare/LCD-show.git
+git clone --depth 1 https://github.com/goodtft/LCD-show.git
+
+sudo cp /tmp/LCD-show/usr/tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
 ```
 
-For Waveshare 3.5 inch LCD A:
-
-```bash
-sudo cp /tmp/LCD-show/waveshare35a-overlay.dtb /boot/overlays/waveshare35a.dtbo
-```
-
-For Waveshare 3.5 inch LCD B v2:
-
-```bash
-sudo cp /tmp/LCD-show/waveshare35b-v2-overlay.dtb /boot/overlays/waveshare35b-v2.dtbo
-```
-
-Append the Volumio boot block for Waveshare A:
+Append the Volumio boot block:
 
 ```bash
 sudo tee -a /boot/userconfig.txt >/dev/null <<'EOF_BOOT'
 
-# Waveshare 3.5 GPIO LCD framebuffer
+# TFT35A framebuffer
 hdmi_force_hotplug=1
 dtparam=spi=on
-dtoverlay=waveshare35a:rotate=270
+dtoverlay=tft35a:rotate=270
 max_usb_current=1
 hdmi_group=2
 hdmi_mode=87
@@ -211,28 +203,16 @@ framebuffer_height=320
 EOF_BOOT
 ```
 
-For Waveshare B v2, use the same block but replace this line:
-
-```text
-dtoverlay=waveshare35a:rotate=270
-```
-
-with:
-
-```text
-dtoverlay=waveshare35b-v2:rotate=270
-```
-
 Default rotation:
 
 ```text
-rotate=270
+dtoverlay=tft35a:rotate=270
 ```
 
 Alternate rotation if the screen is wrong:
 
 ```text
-rotate=90
+dtoverlay=tft35a:rotate=90
 ```
 
 Reboot:
@@ -265,7 +245,92 @@ sudo /usr/local/bin/volumio_fbd /dev/fb1
 
 Use whichever framebuffer works in the systemd service.
 
-## Build
+
+## Install Display Program From GitHub
+
+Use this after the LCD framebuffer is working.
+
+The GitHub repository includes the current display source and a compiled binary.
+
+Repository:
+
+```text
+https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance
+```
+
+Use the `main` branch when you want the newest current copy.
+
+### Option A: Install Current Compiled Binary
+
+This is the fastest path.
+
+```bash
+sudo apt update
+sudo apt install -y git
+
+sudo rm -rf /opt/pi5-volumio-framebuffer-appliance
+sudo git clone --depth 1 https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance.git /opt/pi5-volumio-framebuffer-appliance
+
+sudo install -m 755 "/opt/pi5-volumio-framebuffer-appliance/lcd program/compiled/volumio_fbd" /usr/local/bin/volumio_fbd
+sudo cp -f "/opt/pi5-volumio-framebuffer-appliance/volumio_fbd_config.json" /etc/volumio_fbd_config.json
+sudo chmod 644 /etc/volumio_fbd_config.json
+```
+
+Test it:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb0
+```
+
+If the LCD is on `/dev/fb1`:
+
+```bash
+sudo /usr/local/bin/volumio_fbd /dev/fb1
+```
+
+### Option B: Build Current Source From GitHub
+
+Use this if you want to compile the current source on the Pi.
+
+```bash
+sudo apt update
+sudo apt install -y git build-essential pkg-config libcurl4-openssl-dev libjson-c-dev libfreetype6-dev
+
+sudo rm -rf /opt/pi5-volumio-framebuffer-appliance
+sudo git clone --depth 1 https://github.com/mkinderwater/pi5-volumio-framebuffer-appliance.git /opt/pi5-volumio-framebuffer-appliance
+
+cd "/opt/pi5-volumio-framebuffer-appliance/lcd program/source"
+
+gcc -Os -pipe -Wall -Wextra -pthread \
+  -ffunction-sections -fdata-sections \
+  $(pkg-config --cflags freetype2) \
+  volumio_fbd.c \
+  -o volumio_fbd \
+  $(pkg-config --libs freetype2 libcurl json-c) \
+  -lm -Wl,--gc-sections -s
+
+sudo install -m 755 volumio_fbd /usr/local/bin/volumio_fbd
+sudo cp -f "/opt/pi5-volumio-framebuffer-appliance/volumio_fbd_config.json" /etc/volumio_fbd_config.json
+sudo chmod 644 /etc/volumio_fbd_config.json
+```
+
+### Update Later From GitHub
+
+Use this to pull the newest repo copy and reinstall the compiled binary.
+
+```bash
+sudo systemctl stop volumio-fbd 2>/dev/null || true
+
+cd /opt/pi5-volumio-framebuffer-appliance
+sudo git pull --ff-only
+
+sudo install -m 755 "lcd program/compiled/volumio_fbd" /usr/local/bin/volumio_fbd
+sudo systemctl restart volumio-fbd 2>/dev/null || true
+```
+
+If you changed `/etc/volumio_fbd_config.json`, do not overwrite it during updates unless you want the repo default config again.
+
+## Build From Local Source
 
 Install build dependencies:
 
