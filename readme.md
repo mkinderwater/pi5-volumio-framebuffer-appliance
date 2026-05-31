@@ -392,6 +392,8 @@ ExecStartPre=/bin/sh -c 'echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null |
 
 Example service:
 
+sudo nano /etc/systemd/system/volumio-fbd.service
+
 ```ini
 [Unit]
 Description=Volumio framebuffer display
